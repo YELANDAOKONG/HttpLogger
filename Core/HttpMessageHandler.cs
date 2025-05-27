@@ -7,7 +7,7 @@ public class HttpMessageHandler : IDisposable
     private readonly ProxyConfiguration _config;
     private readonly RequestResponseLogger _logger;
     private readonly HttpClient _httpClient;
-    private bool _disposed;
+    private volatile bool _disposed;
 
     public HttpMessageHandler(ProxyConfiguration config, RequestResponseLogger logger)
     {
@@ -47,41 +47,11 @@ public class HttpMessageHandler : IDisposable
         
         var requestId = Guid.NewGuid().ToString("N")[..8];
         var timestamp = DateTime.Now;
-
-        using var clientDisconnectCts = new CancellationTokenSource();
+        // FIX: Simplified cancellation token management
         using var timeoutCts = new CancellationTokenSource(_config.Timeout);
-        using var combinedCts = CancellationTokenSource.CreateLinkedTokenSource(
-            clientDisconnectCts.Token, 
-            timeoutCts.Token
-        );
-        var cancellationToken = combinedCts.Token;
-
-        // Monitor client connection in background
-        _ = Task.Run(async () =>
-        {
-            try
-            {
-                while (!cancellationToken.IsCancellationRequested)
-                {
-                    if (!IsClientConnected(context.Response))
-                    {
-                        _logger.LogError($"[{requestId}] Client disconnected");
-                        clientDisconnectCts.Cancel();
-                        break;
-                    }
-                    await Task.Delay(1000, cancellationToken);
-                }
-            }
-            catch (OperationCanceledException)
-            {
-                // Expected when request completes
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError($"[{requestId}] Error monitoring client connection: {ex.Message}");
-            }
-        }, CancellationToken.None); // 使用 None 避免立即取消
-
+        var cancellationToken = timeoutCts.Token;
+        // FIX: Simplified client monitoring without interference
+        var clientConnected = true;
         try
         {
             // Read request body with timeout
@@ -89,40 +59,39 @@ public class HttpMessageHandler : IDisposable
             
             // Log request
             await _logger.LogRequestAsync(requestId, timestamp, request, requestBody);
-
+            // Check client connection before proceeding
             if (!IsClientConnected(context.Response))
             {
                 _logger.LogError($"[{requestId}] Client disconnected before forwarding request");
                 return;
             }
-
             // Forward request to remote server with retry logic
             var remoteResponse = await ForwardRequestWithRetryAsync(request, requestBody, requestId, cancellationToken);
             if (remoteResponse == null)
             {
                 throw new HttpRequestException("Failed to get response after all retry attempts");
             }
-
+            // Check client connection again before processing response
             if (!IsClientConnected(context.Response))
             {
                 _logger.LogError($"[{requestId}] Client disconnected before processing response");
                 remoteResponse.Dispose();
                 return;
             }
-
+            // FIX: Use simple client disconnect token
+            using var clientDisconnectCts = new CancellationTokenSource();
+            var clientDisconnectToken = clientDisconnectCts.Token;
             // Choose streaming strategy based on configuration
             if (_config.EnableStreaming)
             {
-                await HandleStreamingResponseAsync(requestId, timestamp, response, remoteResponse, cancellationToken);
+                await HandleStreamingResponseAsync(requestId, timestamp, response, remoteResponse, 
+                    cancellationToken, clientDisconnectToken);
             }
             else
             {
-                await HandleBufferedResponseAsync(requestId, timestamp, response, remoteResponse, cancellationToken);
+                await HandleBufferedResponseAsync(requestId, timestamp, response, remoteResponse, 
+                    cancellationToken, clientDisconnectToken);
             }
-        }
-        catch (OperationCanceledException) when (clientDisconnectCts.Token.IsCancellationRequested)
-        {
-            _logger.LogError($"[{requestId}] Request cancelled: Client disconnected");
         }
         catch (OperationCanceledException) when (timeoutCts.Token.IsCancellationRequested)
         {
@@ -156,27 +125,29 @@ public class HttpMessageHandler : IDisposable
     /// </summary>
     private async Task HandleStreamingResponseAsync(string requestId, DateTime timestamp, 
         HttpListenerResponse clientResponse, HttpResponseMessage remoteResponse, 
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken, CancellationToken clientDisconnectToken)
     {
         try
         {
             // Set response status and headers
             SetupClientResponse(clientResponse, remoteResponse);
-
-            var contentLength = remoteResponse.Content.Headers.ContentLength;
+            // Check content length for streaming strategy
+            var contentLength = remoteResponse.Content?.Headers?.ContentLength;
             var shouldLogFullContent = !contentLength.HasValue || contentLength.Value <= _config.MaxFullLogSize;
-
+            // Get response stream with proper error handling
             using var responseStream = await remoteResponse.Content.ReadAsStreamAsync(cancellationToken);
-            
+        
             if (shouldLogFullContent)
             {
                 // Small response: stream while logging full content
-                await StreamWithFullLogging(requestId, timestamp, responseStream, clientResponse, remoteResponse, cancellationToken);
+                await StreamWithFullLogging(requestId, timestamp, responseStream, clientResponse, 
+                    remoteResponse, cancellationToken, clientDisconnectToken);
             }
             else
             {
                 // Large response: stream with metadata logging only
-                await StreamWithMetadataLogging(requestId, timestamp, responseStream, clientResponse, remoteResponse, cancellationToken);
+                await StreamWithMetadataLogging(requestId, timestamp, responseStream, clientResponse, 
+                    remoteResponse, cancellationToken, clientDisconnectToken);
             }
         }
         catch (Exception ex)
@@ -195,7 +166,7 @@ public class HttpMessageHandler : IDisposable
     /// </summary>
     private async Task HandleBufferedResponseAsync(string requestId, DateTime timestamp, 
         HttpListenerResponse clientResponse, HttpResponseMessage remoteResponse, 
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken, CancellationToken clientDisconnectToken)
     {
         try
         {
@@ -213,7 +184,7 @@ public class HttpMessageHandler : IDisposable
             {
                 await memoryStream.WriteAsync(buffer, 0, bytesRead, cancellationToken);
 
-                if (!IsClientConnected(clientResponse))
+                if (clientDisconnectToken.IsCancellationRequested)
                 {
                     _logger.LogError($"[{requestId}] Client disconnected during response buffering");
                     return;
@@ -225,20 +196,27 @@ public class HttpMessageHandler : IDisposable
             // Log the complete response
             await _logger.LogResponseAsync(requestId, timestamp, remoteResponse, responseBody);
 
-            if (!IsClientConnected(clientResponse))
+            if (clientDisconnectToken.IsCancellationRequested)
             {
                 _logger.LogError($"[{requestId}] Client disconnected before sending response");
                 return;
             }
 
-            // Send buffered response to client
-            if (responseBody.Length > 0)
-            {
-                clientResponse.ContentLength64 = responseBody.Length;
-                await WriteResponseToClient(clientResponse, responseBody, requestId, cancellationToken);
-            }
+            // Send buffered response to client with improved error handling
+            await WriteResponseToClientSafe(clientResponse, responseBody, requestId, cancellationToken);
 
-            clientResponse.Close();
+            // Only close if client hasn't disconnected
+            if (!clientDisconnectToken.IsCancellationRequested)
+            {
+                try
+                {
+                    clientResponse.Close();
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError($"[{requestId}] Error closing client response: {ex.Message}");
+                }
+            }
         }
         catch (Exception ex)
         {
@@ -256,31 +234,32 @@ public class HttpMessageHandler : IDisposable
     /// </summary>
     private async Task StreamWithFullLogging(string requestId, DateTime timestamp,
         Stream responseStream, HttpListenerResponse clientResponse, 
-        HttpResponseMessage remoteResponse, CancellationToken cancellationToken)
+        HttpResponseMessage remoteResponse, CancellationToken cancellationToken, 
+        CancellationToken clientDisconnectToken)
     {
         using var loggingBuffer = new MemoryStream();
         var buffer = new byte[_config.StreamBufferSize];
         int bytesRead;
-
         try
         {
             while ((bytesRead = await responseStream.ReadAsync(buffer, 0, buffer.Length, cancellationToken)) > 0)
             {
-                // Immediately write to client (true streaming)
-                await clientResponse.OutputStream.WriteAsync(buffer, 0, bytesRead, cancellationToken);
-                await clientResponse.OutputStream.FlushAsync(cancellationToken);
-                
-                // Also buffer for logging
-                await loggingBuffer.WriteAsync(buffer, 0, bytesRead, cancellationToken);
-
-                if (!IsClientConnected(clientResponse))
+                // Check client disconnect before writing
+                if (clientDisconnectToken.IsCancellationRequested)
                 {
                     _logger.LogError($"[{requestId}] Client disconnected during streaming");
                     break;
                 }
+                // FIX: Write immediately to client for real-time streaming
+                if (!await WriteToClientSafe(clientResponse, buffer, 0, bytesRead, requestId))
+                {
+                    break; // Client disconnected
+                }
+                
+                // Also buffer for logging
+                await loggingBuffer.WriteAsync(buffer, 0, bytesRead, cancellationToken);
             }
-
-            // Asynchronously log the complete response without passing potentially cancelled token
+            // Asynchronously log the complete response
             var responseBody = loggingBuffer.ToArray();
             _ = Task.Run(async () =>
             {
@@ -292,31 +271,43 @@ public class HttpMessageHandler : IDisposable
                 {
                     Console.WriteLine($"Error logging response for {requestId}: {ex.Message}");
                 }
-            }, CancellationToken.None); // Use None to prevent immediate cancellation
-
-            clientResponse.Close();
+            }, CancellationToken.None);
+            // FIX: Only close if client hasn't disconnected and stream is still writable
+            if (!clientDisconnectToken.IsCancellationRequested && clientResponse.OutputStream?.CanWrite == true)
+            {
+                try
+                {
+                    clientResponse.Close();
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError($"[{requestId}] Error closing client response: {ex.Message}");
+                }
+            }
         }
-        catch (IOException ex)
+        catch (IOException ex) when (ex.Message.Contains("network") || ex.Message.Contains("connection"))
         {
             _logger.LogError($"[{requestId}] Client connection lost during streaming: {ex.Message}");
-        }
-        catch (ArgumentException ex)
-        {
-            _logger.LogError($"[{requestId}] Argument error during streaming: {ex.Message}");
-            throw;
         }
         catch (ObjectDisposedException)
         {
             _logger.LogError($"[{requestId}] Stream disposed during streaming");
         }
+        catch (Exception ex)
+        {
+            _logger.LogError($"[{requestId}] Unexpected error during streaming: {ex.Message}");
+            throw;
+        }
     }
+
 
     /// <summary>
     /// Streams response with metadata logging only (for large responses)
     /// </summary>
     private async Task StreamWithMetadataLogging(string requestId, DateTime timestamp,
         Stream responseStream, HttpListenerResponse clientResponse, 
-        HttpResponseMessage remoteResponse, CancellationToken cancellationToken)
+        HttpResponseMessage remoteResponse, CancellationToken cancellationToken, 
+        CancellationToken clientDisconnectToken)
     {
         var buffer = new byte[_config.StreamBufferSize];
         var firstChunk = new byte[Math.Min(1024, _config.StreamBufferSize)]; // Capture first 1KB
@@ -328,18 +319,28 @@ public class HttpMessageHandler : IDisposable
         {
             while ((bytesRead = await responseStream.ReadAsync(buffer, 0, buffer.Length, cancellationToken)) > 0)
             {
-                // Immediately write to client (true streaming)
-                await clientResponse.OutputStream.WriteAsync(buffer, 0, bytesRead, cancellationToken);
-                await clientResponse.OutputStream.FlushAsync(cancellationToken);
+                // Check client disconnect before writing
+                if (clientDisconnectToken.IsCancellationRequested)
+                {
+                    _logger.LogError($"[{requestId}] Client disconnected during streaming");
+                    break;
+                }
+
+                // Write to client with improved error handling
+                if (!await WriteToClientSafe(clientResponse, buffer, 0, bytesRead, requestId))
+                {
+                    break; // Client disconnected
+                }
                 
-                // Capture first chunk for logging with proper bounds checking
+                // Capture first chunk for logging with proper validation
                 if (!firstChunkCaptured && bytesRead > 0)
                 {
                     var chunkSize = Math.Min(bytesRead, firstChunk.Length);
-                    if (chunkSize > 0 && buffer.Length >= chunkSize && firstChunk.Length >= chunkSize)
+                    if (chunkSize > 0)
                     {
                         Array.Copy(buffer, 0, firstChunk, 0, chunkSize);
-                        // Resize firstChunk to actual copied size
+                        
+                        // Resize firstChunk to actual copied size if needed
                         if (chunkSize < firstChunk.Length)
                         {
                             var actualFirstChunk = new byte[chunkSize];
@@ -351,15 +352,9 @@ public class HttpMessageHandler : IDisposable
                 }
 
                 totalBytes += bytesRead;
-
-                if (!IsClientConnected(clientResponse))
-                {
-                    _logger.LogError($"[{requestId}] Client disconnected during streaming");
-                    break;
-                }
             }
 
-            // Asynchronously log response metadata without passing potentially cancelled token
+            // Asynchronously log response metadata
             _ = Task.Run(async () =>
             {
                 try
@@ -371,25 +366,144 @@ public class HttpMessageHandler : IDisposable
                 {
                     Console.WriteLine($"Error logging response metadata for {requestId}: {ex.Message}");
                 }
-            }, CancellationToken.None); // Use None to prevent immediate cancellation
+            }, CancellationToken.None);
 
-            clientResponse.Close();
+            // Only close if client hasn't disconnected
+            if (!clientDisconnectToken.IsCancellationRequested)
+            {
+                try
+                {
+                    clientResponse.Close();
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError($"[{requestId}] Error closing client response: {ex.Message}");
+                }
+            }
         }
         catch (IOException ex)
         {
             _logger.LogError($"[{requestId}] Client connection lost during streaming: {ex.Message}");
         }
-        catch (ArgumentException ex)
-        {
-            _logger.LogError($"[{requestId}] Argument error during metadata streaming: {ex.Message}");
-            throw;
-        }
         catch (ObjectDisposedException)
         {
             _logger.LogError($"[{requestId}] Stream disposed during streaming");
         }
+        catch (Exception ex)
+        {
+            _logger.LogError($"[{requestId}] Unexpected error during metadata streaming: {ex.Message}");
+            throw;
+        }
     }
 
+    /// <summary>
+    /// Safe method to write data to client with proper error handling
+    /// </summary>
+    private async Task<bool> WriteToClientSafe(HttpListenerResponse clientResponse, byte[] buffer, 
+        int offset, int count, string requestId)
+    {
+        try
+        {
+            if (clientResponse?.OutputStream == null || !clientResponse.OutputStream.CanWrite)
+            {
+                _logger.LogError($"[{requestId}] Client response stream is not writable");
+                return false;
+            }
+            // FIX: Use the correct WriteAsync overload to avoid parameter errors
+            await clientResponse.OutputStream.WriteAsync(buffer, offset, count);
+        
+            // FIX: Immediate flush for streaming responsiveness
+            await clientResponse.OutputStream.FlushAsync();
+            return true;
+        }
+        catch (HttpListenerException ex) when (ex.ErrorCode == 1229) // ERROR_CONNECTION_ABORTED
+        {
+            _logger.LogError($"[{requestId}] Client connection aborted during write");
+            return false;
+        }
+        catch (HttpListenerException ex) when (ex.ErrorCode == 64) // ERROR_NETNAME_DELETED
+        {
+            _logger.LogError($"[{requestId}] Network name no longer available during write");
+            return false;
+        }
+        catch (IOException ex)
+        {
+            _logger.LogError($"[{requestId}] I/O error writing to client: {ex.Message}");
+            return false;
+        }
+        catch (ObjectDisposedException)
+        {
+            _logger.LogError($"[{requestId}] Client response stream disposed during write");
+            return false;
+        }
+        catch (ArgumentException ex)
+        {
+            _logger.LogError($"[{requestId}] Argument error writing to client: {ex.Message}");
+            return false;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError($"[{requestId}] Error writing to client during streaming: {ex.Message}");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Safe method to write response body to client with proper error handling
+    /// </summary>
+    private async Task WriteResponseToClientSafe(HttpListenerResponse clientResponse, byte[] responseBody, 
+        string requestId, CancellationToken cancellationToken)
+    {
+        if (responseBody == null || responseBody.Length == 0)
+            return;
+        if (clientResponse?.OutputStream == null || !clientResponse.OutputStream.CanWrite)
+        {
+            _logger.LogError($"[{requestId}] Client response stream is not writable");
+            return;
+        }
+        // Set content length before writing to avoid issues
+        try
+        {
+            clientResponse.ContentLength64 = responseBody.Length;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError($"[{requestId}] Error setting content length: {ex.Message}");
+        }
+        const int chunkSize = 8192;
+        int offset = 0;
+    
+        try
+        {
+            while (offset < responseBody.Length)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+            
+                if (!clientResponse.OutputStream.CanWrite)
+                {
+                    _logger.LogError($"[{requestId}] Client stream closed during response writing");
+                    return;
+                }
+                var remainingBytes = responseBody.Length - offset;
+                var bytesToWrite = Math.Min(chunkSize, remainingBytes);
+            
+                // FIX: Use correct WriteAsync parameters
+                await clientResponse.OutputStream.WriteAsync(responseBody, offset, bytesToWrite, cancellationToken);
+                await clientResponse.OutputStream.FlushAsync(cancellationToken);
+            
+                offset += bytesToWrite;
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            _logger.LogError($"[{requestId}] Response writing cancelled");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError($"[{requestId}] Error writing response to client: {ex.Message}");
+            throw;
+        }
+    }
 
     private void SetupClientResponse(HttpListenerResponse clientResponse, HttpResponseMessage remoteResponse)
     {
@@ -398,78 +512,59 @@ public class HttpMessageHandler : IDisposable
         if (remoteResponse == null)
             throw new ArgumentNullException(nameof(remoteResponse));
 
-        clientResponse.StatusCode = (int)remoteResponse.StatusCode;
-        clientResponse.StatusDescription = remoteResponse.ReasonPhrase ?? string.Empty;
-        clientResponse.KeepAlive = true;
-
-        // Copy response headers
-        foreach (var header in remoteResponse.Headers)
+        try
         {
-            if (IsHopByHopHeader(header.Key))
-                continue;
+            clientResponse.StatusCode = (int)remoteResponse.StatusCode;
+            clientResponse.StatusDescription = remoteResponse.ReasonPhrase ?? string.Empty;
+            clientResponse.KeepAlive = true;
 
-            try
-            {
-                if (header.Key.Equals("Connection", StringComparison.OrdinalIgnoreCase))
-                {
-                    clientResponse.Headers.Add("Connection", "keep-alive");
-                }
-                else
-                {
-                    clientResponse.Headers.Add(header.Key, string.Join(", ", header.Value));
-                }
-            }
-            catch (Exception ex)
-            {
-                // Log but don't fail for invalid headers
-                Console.WriteLine($"Warning: Failed to copy header {header.Key}: {ex.Message}");
-            }
-        }
-
-        // Copy content headers
-        if (remoteResponse.Content?.Headers != null)
-        {
-            foreach (var header in remoteResponse.Content.Headers)
+            // Copy response headers
+            foreach (var header in remoteResponse.Headers)
             {
                 if (IsHopByHopHeader(header.Key))
                     continue;
 
                 try
                 {
-                    clientResponse.Headers.Add(header.Key, string.Join(", ", header.Value));
+                    if (header.Key.Equals("Connection", StringComparison.OrdinalIgnoreCase))
+                    {
+                        clientResponse.Headers.Add("Connection", "keep-alive");
+                    }
+                    else
+                    {
+                        clientResponse.Headers.Add(header.Key, string.Join(", ", header.Value));
+                    }
                 }
                 catch (Exception ex)
                 {
                     // Log but don't fail for invalid headers
-                    Console.WriteLine($"Warning: Failed to copy content header {header.Key}: {ex.Message}");
+                    Console.WriteLine($"Warning: Failed to copy header {header.Key}: {ex.Message}");
+                }
+            }
+
+            // Copy content headers
+            if (remoteResponse.Content?.Headers != null)
+            {
+                foreach (var header in remoteResponse.Content.Headers)
+                {
+                    if (IsHopByHopHeader(header.Key))
+                        continue;
+
+                    try
+                    {
+                        clientResponse.Headers.Add(header.Key, string.Join(", ", header.Value));
+                    }
+                    catch (Exception ex)
+                    {
+                        // Log but don't fail for invalid headers
+                        Console.WriteLine($"Warning: Failed to copy content header {header.Key}: {ex.Message}");
+                    }
                 }
             }
         }
-    }
-
-    private async Task WriteResponseToClient(HttpListenerResponse clientResponse, byte[] responseBody, 
-        string requestId, CancellationToken cancellationToken)
-    {
-        if (responseBody == null || responseBody.Length == 0)
-            return;
-
-        const int chunkSize = 8192;
-        int offset = 0;
-        
-        while (offset < responseBody.Length)
+        catch (Exception ex)
         {
-            if (!clientResponse.OutputStream.CanWrite)
-            {
-                _logger.LogError($"[{requestId}] Client stream closed during response writing");
-                return;
-            }
-
-            var remainingBytes = responseBody.Length - offset;
-            var bytesToWrite = Math.Min(chunkSize, remainingBytes);
-            
-            await clientResponse.OutputStream.WriteAsync(responseBody, offset, bytesToWrite, cancellationToken);
-            await clientResponse.OutputStream.FlushAsync(cancellationToken);
-            offset += bytesToWrite;
+            throw new InvalidOperationException($"Failed to setup client response: {ex.Message}", ex);
         }
     }
 
@@ -530,75 +625,93 @@ public class HttpMessageHandler : IDisposable
         if (!request.HasEntityBody)
             return Array.Empty<byte>();
 
-        using var bodyStream = request.InputStream;
-        using var memoryStream = new MemoryStream();
-        
-        var buffer = new byte[_config.StreamBufferSize];
-        int bytesRead;
-        
-        while ((bytesRead = await bodyStream.ReadAsync(buffer, 0, buffer.Length, cancellationToken)) > 0)
+        try
         {
-            await memoryStream.WriteAsync(buffer, 0, bytesRead, cancellationToken);
+            using var bodyStream = request.InputStream;
+            using var memoryStream = new MemoryStream();
+            
+            var buffer = new byte[_config.StreamBufferSize];
+            int bytesRead;
+            
+            while ((bytesRead = await bodyStream.ReadAsync(buffer, 0, buffer.Length, cancellationToken)) > 0)
+            {
+                await memoryStream.WriteAsync(buffer, 0, bytesRead, cancellationToken);
+            }
+            
+            return memoryStream.ToArray();
         }
-        
-        return memoryStream.ToArray();
+        catch (Exception ex)
+        {
+            throw new InvalidOperationException($"Failed to read request body: {ex.Message}", ex);
+        }
     }
 
     private async Task<HttpResponseMessage> ForwardRequestAsync(HttpListenerRequest request, byte[] requestBody, CancellationToken cancellationToken)
     {
-        var targetUri = new Uri($"{_config.RemoteBaseUrl}{request.Url!.PathAndQuery}");
-        
-        using var requestMessage = new HttpRequestMessage(new HttpMethod(request.HttpMethod), targetUri);
-        requestMessage.Headers.ConnectionClose = false;
-
-        // Copy headers
-        foreach (string headerName in request.Headers.AllKeys)
+        try
         {
-            if (IsHopByHopHeader(headerName))
-                continue;
+            var targetUri = new Uri($"{_config.RemoteBaseUrl}{request.Url!.PathAndQuery}");
+            
+            using var requestMessage = new HttpRequestMessage(new HttpMethod(request.HttpMethod), targetUri);
+            requestMessage.Headers.ConnectionClose = false;
 
-            var headerValue = request.Headers[headerName];
-            if (string.IsNullOrEmpty(headerValue))
-                continue;
-
-            try
+            // Copy headers
+            foreach (string headerName in request.Headers.AllKeys)
             {
-                if (headerName.Equals("Host", StringComparison.OrdinalIgnoreCase))
+                if (IsHopByHopHeader(headerName))
+                    continue;
+
+                var headerValue = request.Headers[headerName];
+                if (string.IsNullOrEmpty(headerValue))
+                    continue;
+
+                try
                 {
-                    requestMessage.Headers.Host = $"{_config.RemoteAddress}:{_config.RemotePort}";
+                    if (headerName.Equals("Host", StringComparison.OrdinalIgnoreCase))
+                    {
+                        requestMessage.Headers.Host = $"{_config.RemoteAddress}:{_config.RemotePort}";
+                    }
+                    else if (headerName.Equals("Connection", StringComparison.OrdinalIgnoreCase))
+                    {
+                        requestMessage.Headers.Add("Connection", "keep-alive");
+                    }
+                    else if (!requestMessage.Headers.TryAddWithoutValidation(headerName, headerValue))
+                    {
+                        // Try to add to content headers if not a request header
+                        if (requestMessage.Content != null)
+                        {
+                            requestMessage.Content.Headers.TryAddWithoutValidation(headerName, headerValue);
+                        }
+                    }
                 }
-                else if (headerName.Equals("Connection", StringComparison.OrdinalIgnoreCase))
+                catch (Exception ex)
                 {
-                    requestMessage.Headers.Add("Connection", "keep-alive");
-                }
-                else if (!requestMessage.Headers.TryAddWithoutValidation(headerName, headerValue))
-                {
-                    requestMessage.Content?.Headers.TryAddWithoutValidation(headerName, headerValue);
+                    // Log but continue for invalid headers
+                    Console.WriteLine($"Warning: Failed to copy request header {headerName}: {ex.Message}");
                 }
             }
-            catch (Exception ex)
+
+            if (!requestMessage.Headers.Contains("Connection"))
             {
-                // Log but continue for invalid headers
-                Console.WriteLine($"Warning: Failed to copy request header {headerName}: {ex.Message}");
+                requestMessage.Headers.Add("Connection", "keep-alive");
             }
-        }
 
-        if (!requestMessage.Headers.Contains("Connection"))
-        {
-            requestMessage.Headers.Add("Connection", "keep-alive");
-        }
-
-        // Add request body if present
-        if (requestBody.Length > 0)
-        {
-            requestMessage.Content = new ByteArrayContent(requestBody);
-            if (request.ContentType != null)
+            // Add request body if present
+            if (requestBody.Length > 0)
             {
-                requestMessage.Content.Headers.TryAddWithoutValidation("Content-Type", request.ContentType);
+                requestMessage.Content = new ByteArrayContent(requestBody);
+                if (request.ContentType != null)
+                {
+                    requestMessage.Content.Headers.TryAddWithoutValidation("Content-Type", request.ContentType);
+                }
             }
-        }
 
-        return await _httpClient.SendAsync(requestMessage, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+            return await _httpClient.SendAsync(requestMessage, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            throw new HttpRequestException($"Failed to forward request: {ex.Message}", ex);
+        }
     }
 
     private static async Task SendTimeoutResponse(HttpListenerResponse response)
@@ -614,7 +727,7 @@ public class HttpMessageHandler : IDisposable
                 var message = "Proxy Error: Request timeout"u8.ToArray();
                 response.ContentLength64 = message.Length;
                 
-                await response.OutputStream.WriteAsync(message);
+                await response.OutputStream.WriteAsync(message.AsMemory());
                 response.Close();
             }
         }
@@ -637,7 +750,7 @@ public class HttpMessageHandler : IDisposable
                 var buffer = System.Text.Encoding.UTF8.GetBytes($"Proxy Error: {message}");
                 response.ContentLength64 = buffer.Length;
                 
-                await response.OutputStream.WriteAsync(buffer);
+                await response.OutputStream.WriteAsync(buffer.AsMemory());
                 response.Close();
             }
         }
@@ -663,8 +776,8 @@ public class HttpMessageHandler : IDisposable
     {
         if (!_disposed)
         {
-            _httpClient?.Dispose();
             _disposed = true;
+            _httpClient?.Dispose();
         }
     }
 }
