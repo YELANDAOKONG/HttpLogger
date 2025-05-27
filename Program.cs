@@ -32,6 +32,7 @@ static class Program
             configText.AppendLine($"[yellow]Remote:[/] {config.RemoteAddress}:{config.RemotePort}");
             configText.AppendLine($"[green]Session Directory:[/] {logger.SessionPath}");
             configText.AppendLine($"[dim]SSL Validation:[/] {(config.IgnoreSslErrors ? "[red]Disabled[/]" : "[green]Enabled[/]")}");
+            configText.AppendLine($"[dim]Timeout:[/] [yellow]{config.TimeoutSeconds}s[/]");
 
             var panel = new Panel(configText.ToString())
             {
@@ -124,7 +125,8 @@ static class Program
                 RemoteAddress = args[2],
                 RemotePort = int.Parse(args[3]),
                 IgnoreSslErrors = false,
-                OutputPath = Path.GetTempPath()
+                OutputPath = Path.GetTempPath(),
+                TimeoutSeconds = 180 // Default 3 minutes
             };
 
             for (int i = 4; i < args.Length; i++)
@@ -140,6 +142,21 @@ static class Program
                         if (i + 1 < args.Length)
                         {
                             config.OutputPath = args[++i];
+                        }
+                        break;
+                    case "--timeout":
+                    case "-t":
+                        if (i + 1 < args.Length)
+                        {
+                            if (int.TryParse(args[++i], out var timeoutSeconds) && timeoutSeconds > 0)
+                            {
+                                config.TimeoutSeconds = timeoutSeconds;
+                            }
+                            else
+                            {
+                                AnsiConsole.MarkupLine("[red]Error: Invalid timeout value. Must be a positive integer.[/]");
+                                return null;
+                            }
                         }
                         break;
                 }
@@ -173,11 +190,12 @@ static class Program
         table.AddColumn("[bold]Description[/]");
         table.AddRow("[cyan]--ignore-ssl, -k[/]", "Ignore SSL certificate validation errors");
         table.AddRow("[cyan]--output, -o <path>[/]", "Output directory path (default: temp folder)");
+        table.AddRow("[cyan]--timeout, -t <seconds>[/]", "Request timeout in seconds (default: 180)");
         
         AnsiConsole.Write(table);
         AnsiConsole.WriteLine();
         
         AnsiConsole.MarkupLine("[bold]Example:[/]");
-        AnsiConsole.MarkupLine("  HttpLogger 127.0.0.1 8080 api.example.com 443 --ignore-ssl --output ./logs");
+        AnsiConsole.MarkupLine("  HttpLogger 127.0.0.1 8080 api.example.com 443 --ignore-ssl --timeout 300 --output ./logs");
     }
 }

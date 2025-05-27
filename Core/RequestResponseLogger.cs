@@ -38,166 +38,186 @@ public class RequestResponseLogger : IDisposable
 
     public Task LogRequestAsync(string requestId, DateTime timestamp, HttpListenerRequest request, byte[] body)
     {
-        var requestInfo = new RequestInfo
+        try
         {
-            RequestId = requestId,
-            Timestamp = timestamp,
-            Method = request.HttpMethod,
-            Url = request.Url?.ToString() ?? string.Empty,
-            Headers = ExtractHeaders(request.Headers),
-            Body = body,
-            ContentType = request.ContentType ?? string.Empty
-        };
+            var requestInfo = new RequestInfo
+            {
+                RequestId = requestId,
+                Timestamp = timestamp,
+                Method = request.HttpMethod,
+                Url = request.Url?.ToString() ?? string.Empty,
+                Headers = ExtractHeaders(request.Headers),
+                Body = body,
+                ContentType = request.ContentType ?? string.Empty
+            };
 
-        // Prepare data for background processing
-        var requestData = new
+            // Prepare data for background processing
+            var requestData = new
+            {
+                requestInfo.RequestId,
+                requestInfo.Timestamp,
+                requestInfo.Method,
+                requestInfo.Url,
+                requestInfo.Headers,
+                requestInfo.ContentType,
+                BodyBase64 = requestInfo.Body.Length > 0 ? Convert.ToBase64String(requestInfo.Body) : null,
+                BodyText = TryGetTextContent(requestInfo.Body, requestInfo.ContentType)
+            };
+
+            var rawRequest = GenerateRawHttpRequest(request, body);
+
+            // Queue for background processing (non-blocking)
+            _loggingQueue.EnqueueLogEntry(new LogEntry
+            {
+                RequestId = requestId,
+                Timestamp = timestamp,
+                Type = LogEntryType.Request,
+                RequestData = requestData,
+                RawContent = rawRequest
+            });
+
+            // Queue realtime logs for background processing too
+            var summaryMessage = $"[{timestamp:yyyy-MM-dd HH:mm:ss.fff}] REQUEST {requestId}: {request.HttpMethod} {request.Url}";
+            var rawMessage = $"=== REQUEST {requestId} at {timestamp:yyyy-MM-dd HH:mm:ss.fff} ===\n{rawRequest}\n";
+            
+            _realtimeLogQueue.EnqueueRealtimeLog(new RealtimeLogEntry
+            {
+                SummaryMessage = summaryMessage,
+                RawMessage = rawMessage
+            });
+
+            // Add to active requests tracking
+            var pair = new RequestResponsePair { Request = requestInfo };
+            _activeRequests.TryAdd(requestId, pair);
+
+            // Console output with proper escaping for Spectre.Console
+            var urlPath = request.Url?.AbsolutePath ?? string.Empty;
+            var escapedUrlPath = EscapeMarkup(urlPath);
+            var escapedMethod = EscapeMarkup(request.HttpMethod);
+            var escapedRequestId = EscapeMarkup(requestId);
+            AnsiConsole.MarkupLine($"[dim]{timestamp:HH:mm:ss.fff}[/] [bold green]→[/] [cyan]{escapedMethod}[/] {escapedUrlPath} [dim]({escapedRequestId})[/]");
+        }
+        catch (Exception ex)
         {
-            requestInfo.RequestId,
-            requestInfo.Timestamp,
-            requestInfo.Method,
-            requestInfo.Url,
-            requestInfo.Headers,
-            requestInfo.ContentType,
-            BodyBase64 = requestInfo.Body.Length > 0 ? Convert.ToBase64String(requestInfo.Body) : null,
-            BodyText = TryGetTextContent(requestInfo.Body, requestInfo.ContentType)
-        };
-
-        var rawRequest = GenerateRawHttpRequest(request, body);
-
-        // Queue for background processing (non-blocking)
-        _loggingQueue.EnqueueLogEntry(new LogEntry
-        {
-            RequestId = requestId,
-            Timestamp = timestamp,
-            Type = LogEntryType.Request,
-            RequestData = requestData,
-            RawContent = rawRequest
-        });
-
-        // Queue realtime logs for background processing too
-        var summaryMessage = $"[{timestamp:yyyy-MM-dd HH:mm:ss.fff}] REQUEST {requestId}: {request.HttpMethod} {request.Url}";
-        var rawMessage = $"=== REQUEST {requestId} at {timestamp:yyyy-MM-dd HH:mm:ss.fff} ===\n{rawRequest}\n";
-        
-        _realtimeLogQueue.EnqueueRealtimeLog(new RealtimeLogEntry
-        {
-            SummaryMessage = summaryMessage,
-            RawMessage = rawMessage
-        });
-
-        // Add to active requests tracking
-        var pair = new RequestResponsePair { Request = requestInfo };
-        _activeRequests.TryAdd(requestId, pair);
-
-        // Console output with proper escaping for Spectre.Console
-        var urlPath = request.Url?.AbsolutePath ?? string.Empty;
-        var escapedUrlPath = EscapeMarkup(urlPath);
-        AnsiConsole.MarkupLine($"[dim]{timestamp:HH:mm:ss.fff}[/] [bold green]→[/] [cyan]{request.HttpMethod}[/] {escapedUrlPath} [dim]({requestId})[/]");
+            LogError($"Error logging request {requestId}: {ex.Message}");
+        }
 
         return Task.CompletedTask;
     }
 
     public Task LogResponseAsync(string requestId, DateTime timestamp, HttpResponseMessage response, byte[] body)
     {
-        var responseInfo = new ResponseInfo
+        try
         {
-            RequestId = requestId,
-            Timestamp = timestamp,
-            StatusCode = (int)response.StatusCode,
-            StatusDescription = response.ReasonPhrase ?? string.Empty,
-            Headers = ExtractHeaders(response.Headers, response.Content?.Headers),
-            Body = body,
-            ContentType = response.Content?.Headers?.ContentType?.ToString() ?? string.Empty
-        };
-
-        // Prepare data for background processing
-        var responseData = new
-        {
-            responseInfo.RequestId,
-            responseInfo.Timestamp,
-            responseInfo.StatusCode,
-            responseInfo.StatusDescription,
-            responseInfo.Headers,
-            responseInfo.ContentType,
-            BodyBase64 = responseInfo.Body.Length > 0 ? Convert.ToBase64String(responseInfo.Body) : null,
-            BodyText = TryGetTextContent(responseInfo.Body, responseInfo.ContentType)
-        };
-
-        var rawResponse = GenerateRawHttpResponse(response, body);
-
-        // Queue for background processing (non-blocking)
-        _loggingQueue.EnqueueLogEntry(new LogEntry
-        {
-            RequestId = requestId,
-            Timestamp = timestamp,
-            Type = LogEntryType.Response,
-            ResponseData = responseData,
-            RawContent = rawResponse
-        });
-
-        // Update active requests tracking and queue complete data
-        if (_activeRequests.TryGetValue(requestId, out var pair))
-        {
-            pair.Response = responseInfo;
-            pair.CompletedAt = DateTime.Now;
-
-            // Queue complete pair for background processing
-            double? durationMs = null;
-            if (pair.CompletedAt.HasValue)
+            var responseInfo = new ResponseInfo
             {
-                durationMs = (pair.CompletedAt.Value - pair.Request.Timestamp).TotalMilliseconds;
-            }
-
-            var completeData = new
-            {
-                RequestId = pair.Request.RequestId,
-                StartTime = pair.Request.Timestamp,
-                CompletedAt = pair.CompletedAt,
-                DurationMs = durationMs,
-                Request = new
-                {
-                    pair.Request.Method,
-                    pair.Request.Url,
-                    pair.Request.Headers,
-                    pair.Request.ContentType,
-                    BodyBase64 = pair.Request.Body.Length > 0 ? Convert.ToBase64String(pair.Request.Body) : null,
-                    BodyText = TryGetTextContent(pair.Request.Body, pair.Request.ContentType)
-                },
-                Response = new
-                {
-                    pair.Response.StatusCode,
-                    pair.Response.StatusDescription,
-                    pair.Response.Headers,
-                    pair.Response.ContentType,
-                    BodyBase64 = pair.Response.Body.Length > 0 ? Convert.ToBase64String(pair.Response.Body) : null,
-                    BodyText = TryGetTextContent(pair.Response.Body, pair.Response.ContentType)
-                }
+                RequestId = requestId,
+                Timestamp = timestamp,
+                StatusCode = (int)response.StatusCode,
+                StatusDescription = response.ReasonPhrase ?? string.Empty,
+                Headers = ExtractHeaders(response.Headers, response.Content?.Headers),
+                Body = body,
+                ContentType = response.Content?.Headers?.ContentType?.ToString() ?? string.Empty
             };
 
+            // Prepare data for background processing
+            var responseData = new
+            {
+                responseInfo.RequestId,
+                responseInfo.Timestamp,
+                responseInfo.StatusCode,
+                responseInfo.StatusDescription,
+                responseInfo.Headers,
+                responseInfo.ContentType,
+                BodyBase64 = responseInfo.Body.Length > 0 ? Convert.ToBase64String(responseInfo.Body) : null,
+                BodyText = TryGetTextContent(responseInfo.Body, responseInfo.ContentType)
+            };
+
+            var rawResponse = GenerateRawHttpResponse(response, body);
+
+            // Queue for background processing (non-blocking)
             _loggingQueue.EnqueueLogEntry(new LogEntry
             {
                 RequestId = requestId,
                 Timestamp = timestamp,
-                Type = LogEntryType.Complete,
-                CompleteData = completeData
+                Type = LogEntryType.Response,
+                ResponseData = responseData,
+                RawContent = rawResponse
             });
 
-            _activeRequests.TryRemove(requestId, out _);
+            // Update active requests tracking and queue complete data
+            if (_activeRequests.TryGetValue(requestId, out var pair))
+            {
+                pair.Response = responseInfo;
+                pair.CompletedAt = DateTime.Now;
+
+                // Queue complete pair for background processing
+                double? durationMs = null;
+                if (pair.CompletedAt.HasValue)
+                {
+                    durationMs = (pair.CompletedAt.Value - pair.Request.Timestamp).TotalMilliseconds;
+                }
+
+                var completeData = new
+                {
+                    RequestId = pair.Request.RequestId,
+                    StartTime = pair.Request.Timestamp,
+                    CompletedAt = pair.CompletedAt,
+                    DurationMs = durationMs,
+                    Request = new
+                    {
+                        pair.Request.Method,
+                        pair.Request.Url,
+                        pair.Request.Headers,
+                        pair.Request.ContentType,
+                        BodyBase64 = pair.Request.Body.Length > 0 ? Convert.ToBase64String(pair.Request.Body) : null,
+                        BodyText = TryGetTextContent(pair.Request.Body, pair.Request.ContentType)
+                    },
+                    Response = new
+                    {
+                        pair.Response.StatusCode,
+                        pair.Response.StatusDescription,
+                        pair.Response.Headers,
+                        pair.Response.ContentType,
+                        BodyBase64 = pair.Response.Body.Length > 0 ? Convert.ToBase64String(pair.Response.Body) : null,
+                        BodyText = TryGetTextContent(pair.Response.Body, pair.Response.ContentType)
+                    }
+                };
+
+                _loggingQueue.EnqueueLogEntry(new LogEntry
+                {
+                    RequestId = requestId,
+                    Timestamp = timestamp,
+                    Type = LogEntryType.Complete,
+                    CompleteData = completeData
+                });
+
+                _activeRequests.TryRemove(requestId, out _);
+            }
+
+            // Calculate duration for display
+            var duration = DateTime.Now - timestamp;
+            
+            // Queue realtime logs for background processing
+            var summaryMessage = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] RESPONSE {requestId}: {response.StatusCode} ({duration.TotalMilliseconds:F0}ms)";
+            var rawMessage = $"=== RESPONSE {requestId} at {DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} ===\n{rawResponse}\n";
+            
+            _realtimeLogQueue.EnqueueRealtimeLog(new RealtimeLogEntry
+            {
+                SummaryMessage = summaryMessage,
+                RawMessage = rawMessage
+            });
+
+            // Console output with proper status color and escaping
+            var statusColor = GetStatusColor((int)response.StatusCode);
+            var escapedStatusCode = EscapeMarkup(response.StatusCode.ToString());
+            var escapedRequestId = EscapeMarkup(requestId);
+            AnsiConsole.MarkupLine($"[dim]{DateTime.Now:HH:mm:ss.fff}[/] [bold red]←[/] [{statusColor}]{escapedStatusCode}[/] [dim]({duration.TotalMilliseconds:F0}ms) ({escapedRequestId})[/]");
         }
-
-        // Queue realtime logs for background processing
-        var duration = DateTime.Now - timestamp;
-        var summaryMessage = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] RESPONSE {requestId}: {response.StatusCode} ({duration.TotalMilliseconds:F0}ms)";
-        var rawMessage = $"=== RESPONSE {requestId} at {DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} ===\n{rawResponse}\n";
-        
-        _realtimeLogQueue.EnqueueRealtimeLog(new RealtimeLogEntry
+        catch (Exception ex)
         {
-            SummaryMessage = summaryMessage,
-            RawMessage = rawMessage
-        });
-
-        // Console output with proper status color
-        var statusColor = GetStatusColor((int)response.StatusCode);
-        AnsiConsole.MarkupLine($"[dim]{DateTime.Now:HH:mm:ss.fff}[/] [bold red]←[/] [{statusColor}]{response.StatusCode}[/] [dim]({duration.TotalMilliseconds:F0}ms) ({requestId})[/]");
+            LogError($"Error logging response {requestId}: {ex.Message}");
+        }
 
         return Task.CompletedTask;
     }
@@ -216,34 +236,50 @@ public class RequestResponseLogger : IDisposable
 
     public void LogInfo(string message)
     {
-        var logMessage = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] INFO: {message}";
-        
-        // Queue for background processing
-        _realtimeLogQueue.EnqueueRealtimeLog(new RealtimeLogEntry
+        try
         {
-            SummaryMessage = logMessage,
-            RawMessage = null
-        });
-        
-        // Console output with proper escaping
-        var escapedMessage = EscapeMarkup(message);
-        AnsiConsole.MarkupLine($"[dim]{DateTime.Now:HH:mm:ss.fff}[/] [bold blue]ℹ[/] {escapedMessage}");
+            var logMessage = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] INFO: {message}";
+            
+            // Queue for background processing
+            _realtimeLogQueue.EnqueueRealtimeLog(new RealtimeLogEntry
+            {
+                SummaryMessage = logMessage,
+                RawMessage = null
+            });
+            
+            // Console output with proper escaping
+            var escapedMessage = EscapeMarkup(message);
+            AnsiConsole.MarkupLine($"[dim]{DateTime.Now:HH:mm:ss.fff}[/] [bold blue]ℹ[/] {escapedMessage}");
+        }
+        catch (Exception ex)
+        {
+            // Fallback to console directly if logging fails
+            Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] INFO: {message} (Logging error: {ex.Message})");
+        }
     }
 
     public void LogError(string message)
     {
-        var logMessage = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] ERROR: {message}";
-        
-        // Queue for background processing
-        _realtimeLogQueue.EnqueueRealtimeLog(new RealtimeLogEntry
+        try
         {
-            SummaryMessage = logMessage,
-            RawMessage = null
-        });
-        
-        // Console output with proper escaping
-        var escapedMessage = EscapeMarkup(message);
-        AnsiConsole.MarkupLine($"[dim]{DateTime.Now:HH:mm:ss.fff}[/] [bold red]✗[/] {escapedMessage}");
+            var logMessage = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] ERROR: {message}";
+            
+            // Queue for background processing
+            _realtimeLogQueue.EnqueueRealtimeLog(new RealtimeLogEntry
+            {
+                SummaryMessage = logMessage,
+                RawMessage = null
+            });
+            
+            // Console output with proper escaping (removed invalid requestId reference)
+            var escapedMessage = EscapeMarkup(message);
+            AnsiConsole.MarkupLine($"[dim]{DateTime.Now:HH:mm:ss.fff}[/] [bold red]✗[/] {escapedMessage}");
+        }
+        catch (Exception ex)
+        {
+            // Fallback to console directly if logging fails
+            Console.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] ERROR: {message} (Logging error: {ex.Message})");
+        }
     }
 
     /// <summary>
@@ -344,7 +380,7 @@ public class RequestResponseLogger : IDisposable
         return result;
     }
 
-        private static Dictionary<string, string> ExtractHeaders(System.Net.Http.Headers.HttpHeaders headers1, System.Net.Http.Headers.HttpHeaders? headers2 = null)
+    private static Dictionary<string, string> ExtractHeaders(System.Net.Http.Headers.HttpHeaders headers1, System.Net.Http.Headers.HttpHeaders? headers2 = null)
     {
         var result = new Dictionary<string, string>();
         
@@ -391,8 +427,15 @@ public class RequestResponseLogger : IDisposable
 
     public async Task FlushAsync()
     {
-        await _loggingQueue.FlushAsync();
-        await _realtimeLogQueue.FlushAsync();
+        try
+        {
+            await _loggingQueue.FlushAsync();
+            await _realtimeLogQueue.FlushAsync();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error flushing logs: {ex.Message}");
+        }
     }
 
     public void Dispose()
@@ -401,9 +444,19 @@ public class RequestResponseLogger : IDisposable
         {
             LogInfo("HTTP Logger session stopped.");
             
-            _loggingQueue?.Dispose();
-            _realtimeLogQueue?.Dispose();
-            _disposed = true;
+            try
+            {
+                _loggingQueue?.Dispose();
+                _realtimeLogQueue?.Dispose();
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error disposing logger: {ex.Message}");
+            }
+            finally
+            {
+                _disposed = true;
+            }
         }
     }
 
@@ -436,4 +489,3 @@ public class RequestResponseLogger : IDisposable
         public DateTime? CompletedAt { get; set; }
     }
 }
-

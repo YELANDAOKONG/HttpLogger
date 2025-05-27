@@ -24,12 +24,12 @@ public class RealtimeLogQueue : IDisposable
         var summaryLogPath = Path.Combine(_sessionPath, "summary.log");
         var rawLogPath = Path.Combine(_sessionPath, "raw_traffic.log");
 
-        _summaryLogStream = new FileStream(summaryLogPath, FileMode.Create, FileAccess.Write, FileShare.Read);
-        _rawLogStream = new FileStream(rawLogPath, FileMode.Create, FileAccess.Write, FileShare.Read);
+        _summaryLogStream = new FileStream(summaryLogPath, FileMode.Create, FileAccess.Write, FileShare.Read, bufferSize: 4096);
+        _rawLogStream = new FileStream(rawLogPath, FileMode.Create, FileAccess.Write, FileShare.Read, bufferSize: 4096);
         
-        // Don't use AutoFlush - we'll control flushing manually
-        _summaryLogWriter = new StreamWriter(_summaryLogStream, Encoding.UTF8) { AutoFlush = false };
-        _rawLogWriter = new StreamWriter(_rawLogStream, Encoding.UTF8) { AutoFlush = false };
+        // Don't use AutoFlush - we'll control flushing manually for better performance
+        _summaryLogWriter = new StreamWriter(_summaryLogStream, Encoding.UTF8, bufferSize: 4096) { AutoFlush = false };
+        _rawLogWriter = new StreamWriter(_rawLogStream, Encoding.UTF8, bufferSize: 4096) { AutoFlush = false };
 
         _processingTask = Task.Run(ProcessLogEntriesAsync);
     }
@@ -51,25 +51,28 @@ public class RealtimeLogQueue : IDisposable
             try
             {
                 // Use shorter timeout for more responsive flushing
-                await _queueSemaphore.WaitAsync(100, _cancellationTokenSource.Token);
+                await _queueSemaphore.WaitAsync(500, _cancellationTokenSource.Token);
                 
-                // Process entries in small batches
+                // Process entries in larger batches for better performance
                 var processed = 0;
-                while (processed < 50 && _logQueue.TryDequeue(out var entry))
+                var batch = new List<RealtimeLogEntry>();
+                
+                // Collect batch
+                while (processed < 100 && _logQueue.TryDequeue(out var entry))
                 {
-                    _summaryLogWriter.WriteLine(entry.SummaryMessage);
-                    
-                    if (entry.RawMessage != null)
-                    {
-                        _rawLogWriter.WriteLine(entry.RawMessage);
-                    }
-                    
+                    batch.Add(entry);
                     processed++;
+                }
+
+                // Process batch
+                if (batch.Count > 0)
+                {
+                    await ProcessBatchAsync(batch);
                 }
 
                 // Flush periodically or when queue is empty
                 var now = DateTime.Now;
-                if (processed > 0 && (now - lastFlush).TotalMilliseconds > 1000 || _logQueue.IsEmpty)
+                if (processed > 0 && ((now - lastFlush).TotalMilliseconds > 2000 || _logQueue.IsEmpty))
                 {
                     await _summaryLogWriter.FlushAsync();
                     await _rawLogWriter.FlushAsync();
@@ -90,16 +93,37 @@ public class RealtimeLogQueue : IDisposable
         await FlushRemainingEntriesAsync();
     }
 
+    private async Task ProcessBatchAsync(List<RealtimeLogEntry> batch)
+    {
+        try
+        {
+            foreach (var entry in batch)
+            {
+                await _summaryLogWriter.WriteLineAsync(entry.SummaryMessage);
+                
+                if (entry.RawMessage != null)
+                {
+                    await _rawLogWriter.WriteLineAsync(entry.RawMessage);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error processing log batch: {ex.Message}");
+        }
+    }
+
     private async Task FlushRemainingEntriesAsync()
     {
+        var remainingBatch = new List<RealtimeLogEntry>();
         while (_logQueue.TryDequeue(out var entry))
         {
-            _summaryLogWriter.WriteLine(entry.SummaryMessage);
-            
-            if (entry.RawMessage != null)
-            {
-                _rawLogWriter.WriteLine(entry.RawMessage);
-            }
+            remainingBatch.Add(entry);
+        }
+
+        if (remainingBatch.Count > 0)
+        {
+            await ProcessBatchAsync(remainingBatch);
         }
 
         await _summaryLogWriter.FlushAsync();
@@ -108,10 +132,11 @@ public class RealtimeLogQueue : IDisposable
 
     public async Task FlushAsync()
     {
-        // Wait for queue to be empty
-        while (!_logQueue.IsEmpty)
+        // Wait for queue to be empty with timeout
+        var timeout = DateTime.Now.AddSeconds(10);
+        while (!_logQueue.IsEmpty && DateTime.Now < timeout)
         {
-            await Task.Delay(10);
+            await Task.Delay(50);
         }
         
         // Force flush
@@ -127,7 +152,7 @@ public class RealtimeLogQueue : IDisposable
             
             try
             {
-                _processingTask.Wait(TimeSpan.FromSeconds(3));
+                _processingTask.Wait(TimeSpan.FromSeconds(5));
             }
             catch (AggregateException)
             {

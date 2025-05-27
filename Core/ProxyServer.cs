@@ -21,6 +21,11 @@ public class ProxyServer : IDisposable
         _listener = new HttpListener();
         _listener.Prefixes.Add(_config.LocalUrl);
         
+        // Configure listener for better connection handling
+        _listener.TimeoutManager.IdleConnection = TimeSpan.FromMinutes(5);
+        _listener.TimeoutManager.HeaderWait = TimeSpan.FromSeconds(30);
+        _listener.TimeoutManager.EntityBody = TimeSpan.FromMinutes(2);
+        
         _messageHandler = new HttpMessageHandler(_config, _logger);
         
         // Limit concurrent requests to prevent resource exhaustion
@@ -33,7 +38,7 @@ public class ProxyServer : IDisposable
         _logger.LogInfo($"Proxy server started on {_config.LocalUrl}");
 
         // Register cancellation to stop the listener
-        cancellationToken.Register(() =>
+        using var registration = cancellationToken.Register(() =>
         {
             try
             {
@@ -78,6 +83,11 @@ public class ProxyServer : IDisposable
                 {
                     // Cancellation requested
                     break;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError($"Unexpected error in server loop: {ex.Message}");
+                    // Continue running despite errors
                 }
             }
         }
@@ -140,7 +150,7 @@ public class ProxyServer : IDisposable
         {
             // Create timeout for individual request processing
             using var requestCts = CancellationTokenSource.CreateLinkedTokenSource(serverCancellationToken);
-            requestCts.CancelAfter(TimeSpan.FromMinutes(3)); // Total request timeout
+            requestCts.CancelAfter(TimeSpan.FromMinutes(4)); // Total request timeout increased
 
             await _messageHandler.HandleRequestAsync(context);
         }
@@ -151,7 +161,14 @@ public class ProxyServer : IDisposable
         catch (Exception ex)
         {
             _logger.LogError($"Error handling request: {ex.Message}");
-            await SendErrorResponse(context.Response, ex.Message);
+            try
+            {
+                await SendErrorResponse(context.Response, ex.Message);
+            }
+            catch
+            {
+                // Ignore errors when sending error response
+            }
         }
         finally
         {
@@ -167,6 +184,7 @@ public class ProxyServer : IDisposable
             {
                 response.StatusCode = 500;
                 response.ContentType = "text/plain; charset=utf-8";
+                response.KeepAlive = false; // Close connection on error
                 
                 var buffer = Encoding.UTF8.GetBytes($"Proxy Error: {message}");
                 response.ContentLength64 = buffer.Length;
