@@ -26,13 +26,24 @@ static class Program
             // Create a nice banner
             AnsiConsole.Write(new Rule("[bold blue]HTTP Logger Proxy[/]"));
 
-            // Display configuration in a panel (now with actual session path)
+            // Display configuration in a panel
             var configText = new StringBuilder();
             configText.AppendLine($"[cyan]Local:[/] {config.LocalAddress}:{config.LocalPort}");
             configText.AppendLine($"[yellow]Remote:[/] {config.RemoteAddress}:{config.RemotePort}");
             configText.AppendLine($"[green]Session Directory:[/] {logger.SessionPath}");
             configText.AppendLine($"[dim]SSL Validation:[/] {(config.IgnoreSslErrors ? "[red]Disabled[/]" : "[green]Enabled[/]")}");
             configText.AppendLine($"[dim]Timeout:[/] [yellow]{config.TimeoutSeconds}s[/]");
+            
+            // Streaming configuration display
+            if (config.EnableStreaming)
+            {
+                configText.AppendLine($"[dim]Streaming Mode:[/] [green]Enabled[/] (Buffer: {config.StreamBufferSize} bytes)");
+                configText.AppendLine($"[dim]Max Full Log Size:[/] [yellow]{config.MaxFullLogSize / (1024 * 1024)}MB[/]");
+            }
+            else
+            {
+                configText.AppendLine($"[dim]Streaming Mode:[/] [red]Disabled[/] (Full buffering)");
+            }
 
             var panel = new Panel(configText.ToString())
             {
@@ -126,7 +137,10 @@ static class Program
                 RemotePort = int.Parse(args[3]),
                 IgnoreSslErrors = false,
                 OutputPath = Path.GetTempPath(),
-                TimeoutSeconds = 180 // Default 3 minutes
+                TimeoutSeconds = 180, // Default 3 minutes
+                EnableStreaming = false,
+                StreamBufferSize = 8192, // Default 8KB
+                MaxFullLogSize = 10 * 1024 * 1024 // Default 10MB
             };
 
             for (int i = 4; i < args.Length; i++)
@@ -155,6 +169,30 @@ static class Program
                             else
                             {
                                 AnsiConsole.MarkupLine("[red]Error: Invalid timeout value. Must be a positive integer.[/]");
+                                return null;
+                            }
+                        }
+                        break;
+                    case "--stream":
+                    case "-s":
+                        config.EnableStreaming = true;
+                        // Check if next argument is buffer size
+                        if (i + 1 < args.Length && int.TryParse(args[i + 1], out var bufferSize) && bufferSize > 0)
+                        {
+                            config.StreamBufferSize = bufferSize;
+                            i++; // Skip the buffer size argument
+                        }
+                        break;
+                    case "--max-log-size":
+                        if (i + 1 < args.Length)
+                        {
+                            if (long.TryParse(args[++i], out var maxSize) && maxSize > 0)
+                            {
+                                config.MaxFullLogSize = maxSize * 1024 * 1024; // Convert MB to bytes
+                            }
+                            else
+                            {
+                                AnsiConsole.MarkupLine("[red]Error: Invalid max log size. Must be a positive integer (MB).[/]");
                                 return null;
                             }
                         }
@@ -191,11 +229,14 @@ static class Program
         table.AddRow("[cyan]--ignore-ssl, -k[/]", "Ignore SSL certificate validation errors");
         table.AddRow("[cyan]--output, -o <path>[/]", "Output directory path (default: temp folder)");
         table.AddRow("[cyan]--timeout, -t <seconds>[/]", "Request timeout in seconds (default: 180)");
+        table.AddRow("[cyan]--stream, -s [buffer_size][/]", "Enable streaming mode with optional buffer size (default: 8192 bytes)");
+        table.AddRow("[cyan]--max-log-size <mb>[/]", "Maximum size (MB) for full content logging in streaming mode (default: 10)");
         
         AnsiConsole.Write(table);
         AnsiConsole.WriteLine();
         
-        AnsiConsole.MarkupLine("[bold]Example:[/]");
+        AnsiConsole.MarkupLine("[bold]Examples:[/]");
         AnsiConsole.MarkupLine("  HttpLogger 127.0.0.1 8080 api.example.com 443 --ignore-ssl --timeout 300 --output ./logs");
+        AnsiConsole.MarkupLine("  HttpLogger 127.0.0.1 8080 api.example.com 443 --stream 4096 --max-log-size 50");
     }
 }

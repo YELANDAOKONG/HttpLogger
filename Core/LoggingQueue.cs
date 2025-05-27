@@ -11,12 +11,12 @@ public class LoggingQueue : IDisposable
     private readonly CancellationTokenSource _cancellationTokenSource = new();
     private readonly Task _processingTask;
     private readonly SemaphoreSlim _queueSemaphore = new(0);
-    private bool _disposed;
+    private volatile bool _disposed;
 
     public LoggingQueue(string sessionPath)
     {
         _sessionPath = sessionPath;
-        _processingTask = Task.Run(ProcessLogEntriesAsync);
+        _processingTask = Task.Run(ProcessLogEntriesAsync, CancellationToken.None);
     }
 
     public void EnqueueLogEntry(LogEntry entry)
@@ -24,7 +24,14 @@ public class LoggingQueue : IDisposable
         if (_disposed) return;
         
         _logQueue.Enqueue(entry);
-        _queueSemaphore.Release();
+        try
+        {
+            _queueSemaphore.Release();
+        }
+        catch (ObjectDisposedException)
+        {
+            // Queue disposed, ignore
+        }
     }
 
     private async Task ProcessLogEntriesAsync()
@@ -53,6 +60,10 @@ public class LoggingQueue : IDisposable
             {
                 break;
             }
+            catch (ObjectDisposedException)
+            {
+                break;
+            }
             catch (Exception ex)
             {
                 // Log error but continue processing
@@ -70,10 +81,18 @@ public class LoggingQueue : IDisposable
         
         foreach (var entry in batch)
         {
+            if (_disposed) break;
             tasks.Add(ProcessSingleEntryAsync(entry));
         }
 
-        await Task.WhenAll(tasks);
+        try
+        {
+            await Task.WhenAll(tasks);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error processing batch: {ex.Message}");
+        }
     }
 
     private async Task ProcessSingleEntryAsync(LogEntry entry)
@@ -90,6 +109,9 @@ public class LoggingQueue : IDisposable
                     break;
                 case LogEntryType.Complete:
                     await SaveCompleteAsync(entry);
+                    break;
+                case LogEntryType.ResponseMetadata:
+                    await SaveResponseMetadataAsync(entry);
                     break;
             }
         }
@@ -109,8 +131,11 @@ public class LoggingQueue : IDisposable
         await File.WriteAllTextAsync(jsonPath, json, Encoding.UTF8);
         
         // RAW file
-        var rawPath = Path.Combine(_sessionPath, "raw", $"{timestampStr}_{entry.RequestId}_request.txt");
-        await File.WriteAllTextAsync(rawPath, entry.RawContent!, Encoding.UTF8);
+        if (!string.IsNullOrEmpty(entry.RawContent))
+        {
+            var rawPath = Path.Combine(_sessionPath, "raw", $"{timestampStr}_{entry.RequestId}_request.txt");
+            await File.WriteAllTextAsync(rawPath, entry.RawContent, Encoding.UTF8);
+        }
     }
 
     private async Task SaveResponseAsync(LogEntry entry)
@@ -123,8 +148,11 @@ public class LoggingQueue : IDisposable
         await File.WriteAllTextAsync(jsonPath, json, Encoding.UTF8);
         
         // RAW file
-        var rawPath = Path.Combine(_sessionPath, "raw", $"{timestampStr}_{entry.RequestId}_response.txt");
-        await File.WriteAllTextAsync(rawPath, entry.RawContent!, Encoding.UTF8);
+        if (!string.IsNullOrEmpty(entry.RawContent))
+        {
+            var rawPath = Path.Combine(_sessionPath, "raw", $"{timestampStr}_{entry.RequestId}_response.txt");
+            await File.WriteAllTextAsync(rawPath, entry.RawContent, Encoding.UTF8);
+        }
     }
 
     private async Task SaveCompleteAsync(LogEntry entry)
@@ -133,6 +161,23 @@ public class LoggingQueue : IDisposable
         var completePath = Path.Combine(_sessionPath, "complete", $"{timestampStr}_{entry.RequestId}_complete.json");
         var json = JsonSerializer.Serialize(entry.CompleteData, new JsonSerializerOptions { WriteIndented = true });
         await File.WriteAllTextAsync(completePath, json, Encoding.UTF8);
+    }
+    
+    private async Task SaveResponseMetadataAsync(LogEntry entry)
+    {
+        var timestampStr = entry.Timestamp.ToString("yyyyMMdd_HHmmss_fff");
+    
+        // JSON file
+        var jsonPath = Path.Combine(_sessionPath, "responses", $"{timestampStr}_{entry.RequestId}_response_metadata.json");
+        var json = JsonSerializer.Serialize(entry.ResponseData, new JsonSerializerOptions { WriteIndented = true });
+        await File.WriteAllTextAsync(jsonPath, json, Encoding.UTF8);
+    
+        // RAW file
+        if (!string.IsNullOrEmpty(entry.RawContent))
+        {
+            var rawPath = Path.Combine(_sessionPath, "raw", $"{timestampStr}_{entry.RequestId}_response_metadata.txt");
+            await File.WriteAllTextAsync(rawPath, entry.RawContent, Encoding.UTF8);
+        }
     }
 
     private async Task FlushRemainingEntriesAsync()
@@ -151,8 +196,11 @@ public class LoggingQueue : IDisposable
 
     public async Task FlushAsync()
     {
-        // Wait for queue to be empty
-        while (!_logQueue.IsEmpty)
+        if (_disposed) return;
+        
+        // Wait for queue to be empty with timeout
+        var timeout = DateTime.Now.AddSeconds(10);
+        while (!_logQueue.IsEmpty && DateTime.Now < timeout && !_disposed)
         {
             await Task.Delay(10);
         }
@@ -162,6 +210,7 @@ public class LoggingQueue : IDisposable
     {
         if (!_disposed)
         {
+            _disposed = true;
             _cancellationTokenSource.Cancel();
             
             try
@@ -175,7 +224,6 @@ public class LoggingQueue : IDisposable
 
             _cancellationTokenSource.Dispose();
             _queueSemaphore.Dispose();
-            _disposed = true;
         }
     }
 }
@@ -195,5 +243,6 @@ public enum LogEntryType
 {
     Request,
     Response,
-    Complete
+    Complete,
+    ResponseMetadata
 }

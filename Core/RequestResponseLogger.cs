@@ -12,7 +12,7 @@ public class RequestResponseLogger : IDisposable
     private readonly ConcurrentDictionary<string, RequestResponsePair> _activeRequests = new();
     private readonly LoggingQueue _loggingQueue;
     private readonly RealtimeLogQueue _realtimeLogQueue;
-    private bool _disposed;
+    private volatile bool _disposed;
 
     public string SessionPath => _sessionPath;
 
@@ -38,14 +38,30 @@ public class RequestResponseLogger : IDisposable
 
     public Task LogRequestAsync(string requestId, DateTime timestamp, HttpListenerRequest request, byte[] body)
     {
+        if (_disposed) return Task.CompletedTask;
+        
         try
         {
+            if (string.IsNullOrEmpty(requestId))
+            {
+                LogError("Request ID cannot be null or empty");
+                return Task.CompletedTask;
+            }
+
+            if (request?.Url == null)
+            {
+                LogError("Request or URL cannot be null");
+                return Task.CompletedTask;
+            }
+
+            body ??= Array.Empty<byte>();
+
             var requestInfo = new RequestInfo
             {
                 RequestId = requestId,
                 Timestamp = timestamp,
-                Method = request.HttpMethod,
-                Url = request.Url?.ToString() ?? string.Empty,
+                Method = request.HttpMethod ?? "UNKNOWN",
+                Url = request.Url.ToString(),
                 Headers = ExtractHeaders(request.Headers),
                 Body = body,
                 ContentType = request.ContentType ?? string.Empty
@@ -91,9 +107,9 @@ public class RequestResponseLogger : IDisposable
             _activeRequests.TryAdd(requestId, pair);
 
             // Console output with proper escaping for Spectre.Console
-            var urlPath = request.Url?.AbsolutePath ?? string.Empty;
+            var urlPath = request.Url.AbsolutePath;
             var escapedUrlPath = EscapeMarkup(urlPath);
-            var escapedMethod = EscapeMarkup(request.HttpMethod);
+            var escapedMethod = EscapeMarkup(request.HttpMethod ?? "UNKNOWN");
             var escapedRequestId = EscapeMarkup(requestId);
             AnsiConsole.MarkupLine($"[dim]{timestamp:HH:mm:ss.fff}[/] [bold green]→[/] [cyan]{escapedMethod}[/] {escapedUrlPath} [dim]({escapedRequestId})[/]");
         }
@@ -107,8 +123,24 @@ public class RequestResponseLogger : IDisposable
 
     public Task LogResponseAsync(string requestId, DateTime timestamp, HttpResponseMessage response, byte[] body)
     {
+        if (_disposed) return Task.CompletedTask;
+        
         try
         {
+            if (string.IsNullOrEmpty(requestId))
+            {
+                LogError("Request ID cannot be null or empty");
+                return Task.CompletedTask;
+            }
+
+            if (response == null)
+            {
+                LogError("Response cannot be null");
+                return Task.CompletedTask;
+            }
+
+            body ??= Array.Empty<byte>();
+
             var responseInfo = new ResponseInfo
             {
                 RequestId = requestId,
@@ -146,7 +178,7 @@ public class RequestResponseLogger : IDisposable
             });
 
             // Update active requests tracking and queue complete data
-            if (_activeRequests.TryGetValue(requestId, out var pair))
+            if (_activeRequests.TryGetValue(requestId, out var pair) && pair?.Request != null)
             {
                 pair.Response = responseInfo;
                 pair.CompletedAt = DateTime.Now;
@@ -222,6 +254,164 @@ public class RequestResponseLogger : IDisposable
         return Task.CompletedTask;
     }
 
+    /// <summary>
+    /// Logs response metadata for large streaming responses
+    /// </summary>
+    public Task LogResponseMetadataAsync(string requestId, DateTime timestamp, HttpResponseMessage response, 
+        byte[] firstChunk, long totalBytes)
+    {
+        if (_disposed) return Task.CompletedTask;
+        
+        try
+        {
+            // Parameter validation
+            if (string.IsNullOrEmpty(requestId))
+            {
+                LogError("Request ID cannot be null or empty");
+                return Task.CompletedTask;
+            }
+            
+            if (response == null)
+            {
+                LogError("Response cannot be null");
+                return Task.CompletedTask;
+            }
+            
+            if (totalBytes < 0)
+            {
+                LogError("Total bytes cannot be negative");
+                return Task.CompletedTask;
+            }
+
+            firstChunk ??= Array.Empty<byte>();
+
+            var responseInfo = new ResponseInfo
+            {
+                RequestId = requestId,
+                Timestamp = timestamp,
+                StatusCode = (int)response.StatusCode,
+                StatusDescription = response.ReasonPhrase ?? string.Empty,
+                Headers = ExtractHeaders(response.Headers, response.Content?.Headers),
+                Body = firstChunk, // Only store first chunk
+                ContentType = response.Content?.Headers?.ContentType?.ToString() ?? string.Empty
+            };
+
+            // Prepare metadata for background processing
+            var responseMetadata = new
+            {
+                responseInfo.RequestId,
+                responseInfo.Timestamp,
+                responseInfo.StatusCode,
+                responseInfo.StatusDescription,
+                responseInfo.Headers,
+                responseInfo.ContentType,
+                TotalBytes = totalBytes,
+                FirstChunkBase64 = firstChunk.Length > 0 ? Convert.ToBase64String(firstChunk) : null,
+                FirstChunkText = TryGetTextContent(firstChunk, responseInfo.ContentType),
+                IsPartialContent = true,
+                Note = $"Streaming mode: Only first {firstChunk.Length} bytes logged out of {totalBytes} total bytes"
+            };
+
+            var rawResponse = GenerateRawHttpResponseMetadata(response, firstChunk, totalBytes);
+
+            // Queue for background processing
+            _loggingQueue.EnqueueLogEntry(new LogEntry
+            {
+                RequestId = requestId,
+                Timestamp = timestamp,
+                Type = LogEntryType.ResponseMetadata,
+                ResponseData = responseMetadata,
+                RawContent = rawResponse
+            });
+
+            // Update active requests tracking with null checks
+            if (_activeRequests.TryGetValue(requestId, out var pair) && pair?.Request != null)
+            {
+                pair.Response = responseInfo;
+                pair.CompletedAt = DateTime.Now;
+
+                // Queue complete data with metadata
+                var completeData = CreateCompleteDataWithMetadata(pair, totalBytes);
+                _loggingQueue.EnqueueLogEntry(new LogEntry
+                {
+                    RequestId = requestId,
+                    Timestamp = timestamp,
+                    Type = LogEntryType.Complete,
+                    CompleteData = completeData
+                });
+
+                _activeRequests.TryRemove(requestId, out _);
+            }
+
+            // Calculate duration and queue realtime logs
+            var duration = DateTime.Now - timestamp;
+            var summaryMessage = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] RESPONSE {requestId}: {response.StatusCode} ({duration.TotalMilliseconds:F0}ms) [STREAMING: {totalBytes} bytes]";
+            var rawMessage = $"=== RESPONSE {requestId} at {DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} (STREAMING) ===\n{rawResponse}\n";
+            
+            _realtimeLogQueue.EnqueueRealtimeLog(new RealtimeLogEntry
+            {
+                SummaryMessage = summaryMessage,
+                RawMessage = rawMessage
+            });
+
+            // Console output
+            var statusColor = GetStatusColor((int)response.StatusCode);
+            var escapedStatusCode = EscapeMarkup(response.StatusCode.ToString());
+            var escapedRequestId = EscapeMarkup(requestId);
+            AnsiConsole.MarkupLine($"[dim]{DateTime.Now:HH:mm:ss.fff}[/] [bold red]←[/] [{statusColor}]{escapedStatusCode}[/] [dim]({duration.TotalMilliseconds:F0}ms) ({FormatBytes(totalBytes)}) ({escapedRequestId})[/]");
+        }
+        catch (Exception ex)
+        {
+            LogError($"Error logging response metadata {requestId}: {ex.Message}");
+        }
+
+        return Task.CompletedTask;
+    }
+
+    private object CreateCompleteDataWithMetadata(RequestResponsePair pair, long totalBytes)
+    {
+        if (pair?.Request == null)
+        {
+            LogError("Request pair or request cannot be null");
+            return new { Error = "Invalid request pair" };
+        }
+
+        double? durationMs = null;
+        if (pair.CompletedAt.HasValue)
+        {
+            durationMs = (pair.CompletedAt.Value - pair.Request.Timestamp).TotalMilliseconds;
+        }
+
+        return new
+        {
+            RequestId = pair.Request.RequestId,
+            StartTime = pair.Request.Timestamp,
+            CompletedAt = pair.CompletedAt,
+            DurationMs = durationMs,
+            Request = new
+            {
+                pair.Request.Method,
+                pair.Request.Url,
+                pair.Request.Headers,
+                pair.Request.ContentType,
+                BodyBase64 = pair.Request.Body.Length > 0 ? Convert.ToBase64String(pair.Request.Body) : null,
+                BodyText = TryGetTextContent(pair.Request.Body, pair.Request.ContentType)
+            },
+            Response = pair.Response != null ? new
+            {
+                pair.Response.StatusCode,
+                pair.Response.StatusDescription,
+                pair.Response.Headers,
+                pair.Response.ContentType,
+                FirstChunkBase64 = pair.Response.Body.Length > 0 ? Convert.ToBase64String(pair.Response.Body) : null,
+                FirstChunkText = TryGetTextContent(pair.Response.Body, pair.Response.ContentType),
+                TotalBytes = totalBytes,
+                IsStreamingMode = true,
+                Note = $"Streaming mode: Only first {pair.Response.Body.Length} bytes captured"
+            } : null
+        };
+    }
+
     private static string GetStatusColor(int statusCode)
     {
         return statusCode switch
@@ -236,6 +426,8 @@ public class RequestResponseLogger : IDisposable
 
     public void LogInfo(string message)
     {
+        if (_disposed) return;
+        
         try
         {
             var logMessage = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] INFO: {message}";
@@ -264,14 +456,17 @@ public class RequestResponseLogger : IDisposable
         {
             var logMessage = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] ERROR: {message}";
             
-            // Queue for background processing
-            _realtimeLogQueue.EnqueueRealtimeLog(new RealtimeLogEntry
+            // Queue for background processing only if not disposed
+            if (!_disposed)
             {
-                SummaryMessage = logMessage,
-                RawMessage = null
-            });
+                _realtimeLogQueue.EnqueueRealtimeLog(new RealtimeLogEntry
+                {
+                    SummaryMessage = logMessage,
+                    RawMessage = null
+                });
+            }
             
-            // Console output with proper escaping (removed invalid requestId reference)
+            // Console output with proper escaping
             var escapedMessage = EscapeMarkup(message);
             AnsiConsole.MarkupLine($"[dim]{DateTime.Now:HH:mm:ss.fff}[/] [bold red]✗[/] {escapedMessage}");
         }
@@ -288,7 +483,7 @@ public class RequestResponseLogger : IDisposable
     private static string EscapeMarkup(string text)
     {
         if (string.IsNullOrEmpty(text))
-            return text;
+            return text ?? string.Empty;
 
         return text.Replace("[", "[[").Replace("]", "]]");
     }
@@ -297,31 +492,42 @@ public class RequestResponseLogger : IDisposable
     {
         var sb = new StringBuilder();
         
-        // Request line
-        sb.AppendLine($"{request.HttpMethod} {request.Url?.PathAndQuery} HTTP/1.1");
-        
-        // Headers
-        foreach (string headerName in request.Headers.AllKeys)
+        try
         {
-            if (headerName != null)
+            // Request line
+            sb.AppendLine($"{request.HttpMethod ?? "UNKNOWN"} {request.Url?.PathAndQuery ?? "/"} HTTP/1.1");
+            
+            // Headers
+            if (request.Headers != null)
             {
-                sb.AppendLine($"{headerName}: {request.Headers[headerName]}");
+                foreach (string? headerName in request.Headers.AllKeys)
+                {
+                    if (!string.IsNullOrEmpty(headerName))
+                    {
+                        var headerValue = request.Headers[headerName];
+                        sb.AppendLine($"{headerName}: {headerValue ?? string.Empty}");
+                    }
+                }
+            }
+            
+            sb.AppendLine(); // Empty line between headers and body
+            
+            // Body
+            if (body?.Length > 0)
+            {
+                if (TryGetTextContent(body, request.ContentType ?? string.Empty) is string textContent)
+                {
+                    sb.AppendLine(textContent);
+                }
+                else
+                {
+                    sb.AppendLine($"[Binary content: {body.Length} bytes]");
+                }
             }
         }
-        
-        sb.AppendLine(); // Empty line between headers and body
-        
-        // Body
-        if (body.Length > 0)
+        catch (Exception ex)
         {
-            if (TryGetTextContent(body, request.ContentType ?? string.Empty) is string textContent)
-            {
-                sb.AppendLine(textContent);
-            }
-            else
-            {
-                sb.AppendLine($"[Binary content: {body.Length} bytes]");
-            }
+            sb.AppendLine($"[Error generating raw request: {ex.Message}]");
         }
 
         return sb.ToString();
@@ -331,70 +537,163 @@ public class RequestResponseLogger : IDisposable
     {
         var sb = new StringBuilder();
         
-        // Status line
-        sb.AppendLine($"HTTP/1.1 {(int)response.StatusCode} {response.ReasonPhrase}");
-        
-        // Headers
-        foreach (var header in response.Headers)
+        try
         {
-            sb.AppendLine($"{header.Key}: {string.Join(", ", header.Value)}");
-        }
-        
-        if (response.Content?.Headers != null)
-        {
-            foreach (var header in response.Content.Headers)
+            // Status line
+            sb.AppendLine($"HTTP/1.1 {(int)response.StatusCode} {response.ReasonPhrase ?? string.Empty}");
+            
+            // Headers
+            foreach (var header in response.Headers)
             {
                 sb.AppendLine($"{header.Key}: {string.Join(", ", header.Value)}");
             }
+            
+            if (response.Content?.Headers != null)
+            {
+                foreach (var header in response.Content.Headers)
+                {
+                    sb.AppendLine($"{header.Key}: {string.Join(", ", header.Value)}");
+                }
+            }
+            
+            sb.AppendLine(); // Empty line between headers and body
+            
+            // Body
+            if (body?.Length > 0)
+            {
+                var contentType = response.Content?.Headers?.ContentType?.ToString() ?? string.Empty;
+                if (TryGetTextContent(body, contentType) is string textContent)
+                {
+                    sb.AppendLine(textContent);
+                }
+                else
+                {
+                    sb.AppendLine($"[Binary content: {body.Length} bytes]");
+                }
+            }
         }
-        
-        sb.AppendLine(); // Empty line between headers and body
-        
-        // Body
-        if (body.Length > 0)
+        catch (Exception ex)
         {
-            var contentType = response.Content?.Headers?.ContentType?.ToString() ?? string.Empty;
-            if (TryGetTextContent(body, contentType) is string textContent)
-            {
-                sb.AppendLine(textContent);
-            }
-            else
-            {
-                sb.AppendLine($"[Binary content: {body.Length} bytes]");
-            }
+            sb.AppendLine($"[Error generating raw response: {ex.Message}]");
         }
 
         return sb.ToString();
     }
 
-    private static Dictionary<string, string> ExtractHeaders(System.Collections.Specialized.NameValueCollection headers)
+    private static string GenerateRawHttpResponseMetadata(HttpResponseMessage response, byte[] firstChunk, long totalBytes)
     {
-        var result = new Dictionary<string, string>();
-        foreach (string? key in headers.AllKeys)
+        var sb = new StringBuilder();
+        
+        try
         {
-            if (key != null)
+            // Status line
+            sb.AppendLine($"HTTP/1.1 {(int)response.StatusCode} {response.ReasonPhrase ?? string.Empty}");
+            
+            // Headers
+            foreach (var header in response.Headers)
             {
-                result[key] = headers[key] ?? string.Empty;
+                sb.AppendLine($"{header.Key}: {string.Join(", ", header.Value)}");
+            }
+            
+            if (response.Content?.Headers != null)
+            {
+                foreach (var header in response.Content.Headers)
+                {
+                    sb.AppendLine($"{header.Key}: {string.Join(", ", header.Value)}");
+                }
+            }
+            
+            sb.AppendLine(); // Empty line between headers and body
+            
+            // Body metadata
+            sb.AppendLine($"[STREAMING MODE - Total: {totalBytes} bytes]");
+            if (firstChunk?.Length > 0)
+            {
+                var contentType = response.Content?.Headers?.ContentType?.ToString() ?? string.Empty;
+                if (TryGetTextContent(firstChunk, contentType) is string textContent)
+                {
+                    sb.AppendLine($"[First {firstChunk.Length} bytes]:");
+                    sb.AppendLine(textContent);
+                    sb.AppendLine("[... content truncated in streaming mode ...]");
+                }
+                else
+                {
+                    sb.AppendLine($"[Binary content - first {firstChunk.Length} bytes of {totalBytes} total]");
+                }
             }
         }
-        return result;
+        catch (Exception ex)
+        {
+            sb.AppendLine($"[Error generating raw response metadata: {ex.Message}]");
+        }
+
+        return sb.ToString();
     }
 
-    private static Dictionary<string, string> ExtractHeaders(System.Net.Http.Headers.HttpHeaders headers1, System.Net.Http.Headers.HttpHeaders? headers2 = null)
+    private static string FormatBytes(long bytes)
+    {
+        if (bytes < 0) return "0B";
+        
+        string[] suffixes = { "B", "KB", "MB", "GB" };
+        int counter = 0;
+        decimal number = bytes;
+        while (Math.Round(number / 1024) >= 1 && counter < suffixes.Length - 1)
+        {
+            number /= 1024;
+            counter++;
+        }
+        return $"{number:n1}{suffixes[counter]}";
+    }
+
+    private static Dictionary<string, string> ExtractHeaders(System.Collections.Specialized.NameValueCollection? headers)
     {
         var result = new Dictionary<string, string>();
         
-        foreach (var header in headers1)
+        if (headers == null) return result;
+        
+        try
         {
-            result[header.Key] = string.Join(", ", header.Value);
-        }
-
-        if (headers2 != null)
-        {
-            foreach (var header in headers2)
+            foreach (string? key in headers.AllKeys)
             {
-                result[header.Key] = string.Join(", ", header.Value);
+                if (!string.IsNullOrEmpty(key))
+                {
+                    result[key] = headers[key] ?? string.Empty;
+                }
             }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Warning: Error extracting headers: {ex.Message}");
+        }
+        
+        return result;
+    }
+
+    private static Dictionary<string, string> ExtractHeaders(System.Net.Http.Headers.HttpHeaders? headers1, System.Net.Http.Headers.HttpHeaders? headers2 = null)
+    {
+        var result = new Dictionary<string, string>();
+        
+        try
+        {
+            if (headers1 != null)
+            {
+                foreach (var header in headers1)
+                {
+                    result[header.Key] = string.Join(", ", header.Value);
+                }
+            }
+
+            if (headers2 != null)
+            {
+                foreach (var header in headers2)
+                {
+                    result[header.Key] = string.Join(", ", header.Value);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Warning: Error extracting HTTP headers: {ex.Message}");
         }
 
         return result;
@@ -402,7 +701,7 @@ public class RequestResponseLogger : IDisposable
 
     private static string? TryGetTextContent(byte[] body, string contentType)
     {
-        if (body.Length == 0)
+        if (body?.Length == 0 || body == null)
             return null;
 
         // Only try to decode text content types
@@ -427,6 +726,8 @@ public class RequestResponseLogger : IDisposable
 
     public async Task FlushAsync()
     {
+        if (_disposed) return;
+        
         try
         {
             await _loggingQueue.FlushAsync();
@@ -442,6 +743,8 @@ public class RequestResponseLogger : IDisposable
     {
         if (!_disposed)
         {
+            _disposed = true;
+            
             LogInfo("HTTP Logger session stopped.");
             
             try
@@ -452,10 +755,6 @@ public class RequestResponseLogger : IDisposable
             catch (Exception ex)
             {
                 Console.WriteLine($"Error disposing logger: {ex.Message}");
-            }
-            finally
-            {
-                _disposed = true;
             }
         }
     }

@@ -11,7 +11,7 @@ public class ProxyServer : IDisposable
     private readonly HttpListener _listener;
     private readonly HttpMessageHandler _messageHandler;
     private readonly SemaphoreSlim _requestSemaphore;
-    private bool _disposed;
+    private volatile bool _disposed;
 
     public ProxyServer(ProxyConfiguration config, RequestResponseLogger logger)
     {
@@ -34,25 +34,14 @@ public class ProxyServer : IDisposable
 
     public async Task StartAsync(CancellationToken cancellationToken = default)
     {
+        if (_disposed) return;
+        
         _listener.Start();
         _logger.LogInfo($"Proxy server started on {_config.LocalUrl}");
 
-        // Register cancellation to stop the listener
-        using var registration = cancellationToken.Register(() =>
-        {
-            try
-            {
-                _listener?.Stop();
-            }
-            catch (ObjectDisposedException)
-            {
-                // Already disposed, ignore
-            }
-        });
-
         try
         {
-            while (!cancellationToken.IsCancellationRequested)
+            while (!cancellationToken.IsCancellationRequested && !_disposed)
             {
                 try
                 {
@@ -61,8 +50,9 @@ public class ProxyServer : IDisposable
                     if (context == null)
                         continue;
                     
-                    // Handle request with concurrency control
-                    _ = HandleRequestWithSemaphoreAsync(context, cancellationToken);
+                    // Handle request with concurrency control in background
+                    _ = Task.Run(async () => await HandleRequestWithSemaphoreAsync(context, cancellationToken), 
+                                 CancellationToken.None); // Use None to prevent immediate cancellation
                 }
                 catch (HttpListenerException ex) when (ex.ErrorCode == 995) // ERROR_OPERATION_ABORTED
                 {
@@ -104,6 +94,10 @@ public class ProxyServer : IDisposable
             {
                 // Already disposed
             }
+            catch (Exception ex)
+            {
+                _logger.LogError($"Error stopping listener: {ex.Message}");
+            }
             
             _logger.LogInfo("Proxy server stopped");
         }
@@ -137,17 +131,20 @@ public class ProxyServer : IDisposable
 
     private async Task HandleRequestWithSemaphoreAsync(HttpListenerContext context, CancellationToken serverCancellationToken)
     {
+        if (_disposed) return;
+        
         // Wait for semaphore with timeout to prevent hanging
-        var acquired = await _requestSemaphore.WaitAsync(TimeSpan.FromSeconds(30), serverCancellationToken);
-        if (!acquired)
-        {
-            _logger.LogError("Request rejected: Server too busy");
-            await SendErrorResponse(context.Response, "Server too busy");
-            return;
-        }
-
+        var acquired = false;
         try
         {
+            acquired = await _requestSemaphore.WaitAsync(TimeSpan.FromSeconds(30), serverCancellationToken);
+            if (!acquired)
+            {
+                _logger.LogError("Request rejected: Server too busy");
+                await SendErrorResponse(context.Response, "Server too busy");
+                return;
+            }
+
             // Create timeout for individual request processing
             using var requestCts = CancellationTokenSource.CreateLinkedTokenSource(serverCancellationToken);
             requestCts.CancelAfter(TimeSpan.FromMinutes(4)); // Total request timeout increased
@@ -172,7 +169,10 @@ public class ProxyServer : IDisposable
         }
         finally
         {
-            _requestSemaphore.Release();
+            if (acquired)
+            {
+                _requestSemaphore.Release();
+            }
         }
     }
 
@@ -180,7 +180,7 @@ public class ProxyServer : IDisposable
     {
         try
         {
-            if (response.OutputStream.CanWrite)
+            if (response?.OutputStream?.CanWrite == true)
             {
                 response.StatusCode = 500;
                 response.ContentType = "text/plain; charset=utf-8";
@@ -203,6 +203,8 @@ public class ProxyServer : IDisposable
     {
         if (!_disposed)
         {
+            _disposed = true;
+            
             try
             {
                 _listener?.Stop();
@@ -212,10 +214,13 @@ public class ProxyServer : IDisposable
             {
                 // Already disposed
             }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error disposing listener: {ex.Message}");
+            }
             
             _messageHandler?.Dispose();
             _requestSemaphore?.Dispose();
-            _disposed = true;
         }
     }
 }

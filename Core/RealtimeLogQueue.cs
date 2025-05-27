@@ -14,7 +14,7 @@ public class RealtimeLogQueue : IDisposable
     private readonly FileStream _rawLogStream;
     private readonly StreamWriter _summaryLogWriter;
     private readonly StreamWriter _rawLogWriter;
-    private bool _disposed;
+    private volatile bool _disposed;
 
     public RealtimeLogQueue(string sessionPath)
     {
@@ -31,7 +31,7 @@ public class RealtimeLogQueue : IDisposable
         _summaryLogWriter = new StreamWriter(_summaryLogStream, Encoding.UTF8, bufferSize: 4096) { AutoFlush = false };
         _rawLogWriter = new StreamWriter(_rawLogStream, Encoding.UTF8, bufferSize: 4096) { AutoFlush = false };
 
-        _processingTask = Task.Run(ProcessLogEntriesAsync);
+        _processingTask = Task.Run(ProcessLogEntriesAsync, CancellationToken.None);
     }
 
     public void EnqueueRealtimeLog(RealtimeLogEntry entry)
@@ -39,7 +39,14 @@ public class RealtimeLogQueue : IDisposable
         if (_disposed) return;
         
         _logQueue.Enqueue(entry);
-        _queueSemaphore.Release();
+        try
+        {
+            _queueSemaphore.Release();
+        }
+        catch (ObjectDisposedException)
+        {
+            // Queue disposed, ignore
+        }
     }
 
     private async Task ProcessLogEntriesAsync()
@@ -74,12 +81,24 @@ public class RealtimeLogQueue : IDisposable
                 var now = DateTime.Now;
                 if (processed > 0 && ((now - lastFlush).TotalMilliseconds > 2000 || _logQueue.IsEmpty))
                 {
-                    await _summaryLogWriter.FlushAsync();
-                    await _rawLogWriter.FlushAsync();
-                    lastFlush = now;
+                    try
+                    {
+                        await _summaryLogWriter.FlushAsync();
+                        await _rawLogWriter.FlushAsync();
+                        lastFlush = now;
+                    }
+                    catch (ObjectDisposedException)
+                    {
+                        // Writers disposed, exit
+                        break;
+                    }
                 }
             }
             catch (OperationCanceledException)
+            {
+                break;
+            }
+            catch (ObjectDisposedException)
             {
                 break;
             }
@@ -99,6 +118,8 @@ public class RealtimeLogQueue : IDisposable
         {
             foreach (var entry in batch)
             {
+                if (_disposed) break;
+                
                 await _summaryLogWriter.WriteLineAsync(entry.SummaryMessage);
                 
                 if (entry.RawMessage != null)
@@ -106,6 +127,10 @@ public class RealtimeLogQueue : IDisposable
                     await _rawLogWriter.WriteLineAsync(entry.RawMessage);
                 }
             }
+        }
+        catch (ObjectDisposedException)
+        {
+            // Writers disposed, ignore
         }
         catch (Exception ex)
         {
@@ -126,28 +151,45 @@ public class RealtimeLogQueue : IDisposable
             await ProcessBatchAsync(remainingBatch);
         }
 
-        await _summaryLogWriter.FlushAsync();
-        await _rawLogWriter.FlushAsync();
+        try
+        {
+            await _summaryLogWriter.FlushAsync();
+            await _rawLogWriter.FlushAsync();
+        }
+        catch (ObjectDisposedException)
+        {
+            // Writers disposed, ignore
+        }
     }
 
     public async Task FlushAsync()
     {
+        if (_disposed) return;
+        
         // Wait for queue to be empty with timeout
         var timeout = DateTime.Now.AddSeconds(10);
-        while (!_logQueue.IsEmpty && DateTime.Now < timeout)
+        while (!_logQueue.IsEmpty && DateTime.Now < timeout && !_disposed)
         {
             await Task.Delay(50);
         }
         
         // Force flush
-        await _summaryLogWriter.FlushAsync();
-        await _rawLogWriter.FlushAsync();
+        try
+        {
+            await _summaryLogWriter.FlushAsync();
+            await _rawLogWriter.FlushAsync();
+        }
+        catch (ObjectDisposedException)
+        {
+            // Writers disposed, ignore
+        }
     }
 
     public void Dispose()
     {
         if (!_disposed)
         {
+            _disposed = true;
             _cancellationTokenSource.Cancel();
             
             try
@@ -159,13 +201,20 @@ public class RealtimeLogQueue : IDisposable
                 // Ignore timeout
             }
 
-            _summaryLogWriter?.Dispose();
-            _rawLogWriter?.Dispose();
-            _summaryLogStream?.Dispose();
-            _rawLogStream?.Dispose();
+            try
+            {
+                _summaryLogWriter?.Dispose();
+                _rawLogWriter?.Dispose();
+                _summaryLogStream?.Dispose();
+                _rawLogStream?.Dispose();
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error disposing realtime log queue: {ex.Message}");
+            }
+            
             _cancellationTokenSource.Dispose();
             _queueSemaphore.Dispose();
-            _disposed = true;
         }
     }
 }
