@@ -1,0 +1,91 @@
+﻿name: .NET Build and Release
+
+on:
+  push:
+    branches: [ "master" ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ "master" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - name: Restore dependencies
+        run: dotnet restore
+      - name: Build
+        run: dotnet build --no-restore
+      - name: Test
+        run: dotnet test --no-build --verbosity normal
+
+  publish:
+    needs: build
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/'))
+    runs-on: ${{ matrix.os }}
+    
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            rid: linux-x64
+          - os: windows-latest
+            rid: win-x64
+    
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Set Version
+        id: version
+        run: |
+          if [[ $GITHUB_REF == refs/tags/v* ]]; then
+            VERSION=${GITHUB_REF#refs/tags/v}
+          else
+            VERSION=$(date +'%Y.%m.%d').$GITHUB_RUN_NUMBER
+          fi
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+        shell: bash
+
+      - name: Restore dependencies
+        run: dotnet restore
+
+      - name: Publish
+        run: dotnet publish --configuration Release --runtime ${{ matrix.rid }} --self-contained true -p:PublishSingleFile=true -p:VersionPrefix=${{ env.VERSION }} -o ./publish
+
+      - name: Zip Release (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          cd publish
+          zip -r ../app-${{ env.VERSION }}-${{ matrix.rid }}.zip *
+
+      - name: Zip Release (Windows)
+        if: matrix.os == 'windows-latest'
+        run: |
+          Compress-Archive -Path ./publish/* -DestinationPath ./app-${{ env.VERSION }}-${{ matrix.rid }}.zip
+        shell: pwsh
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-${{ env.VERSION }}-${{ matrix.rid }}
+          path: ./app-${{ env.VERSION }}-${{ matrix.rid }}.zip
+
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: ./app-${{ env.VERSION }}-${{ matrix.rid }}.zip
+          name: Release ${{ env.VERSION }}
+          draft: false
+          prerelease: false
