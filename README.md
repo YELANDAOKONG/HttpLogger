@@ -16,3 +16,8 @@
 ./HttpLogger 127.0.0.1 8080 api.siliconflow.cn 443
 ```
 
+> 具体参数请查看 `Program.cs`；
+
+### 温馨提示
+
+本工具几乎完全由 AI 编写，如需使用请留意代码质量。

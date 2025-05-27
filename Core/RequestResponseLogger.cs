@@ -257,34 +257,23 @@ public class RequestResponseLogger : IDisposable
     /// <summary>
     /// Logs response metadata for large streaming responses
     /// </summary>
-    public Task LogResponseMetadataAsync(string requestId, DateTime timestamp, HttpResponseMessage response, 
-        byte[] firstChunk, long totalBytes)
+    public Task LogResponseMetadataAsync(string requestId, DateTime timestamp, HttpResponseMessage response, byte[] firstChunk, long totalBytes)
     {
         if (_disposed) return Task.CompletedTask;
         
         try
         {
-            // Parameter validation
             if (string.IsNullOrEmpty(requestId))
             {
                 LogError("Request ID cannot be null or empty");
                 return Task.CompletedTask;
             }
-            
             if (response == null)
             {
                 LogError("Response cannot be null");
                 return Task.CompletedTask;
             }
-            
-            if (totalBytes < 0)
-            {
-                LogError("Total bytes cannot be negative");
-                return Task.CompletedTask;
-            }
-
             firstChunk ??= Array.Empty<byte>();
-
             var responseInfo = new ResponseInfo
             {
                 RequestId = requestId,
@@ -292,12 +281,11 @@ public class RequestResponseLogger : IDisposable
                 StatusCode = (int)response.StatusCode,
                 StatusDescription = response.ReasonPhrase ?? string.Empty,
                 Headers = ExtractHeaders(response.Headers, response.Content?.Headers),
-                Body = firstChunk, // Only store first chunk
+                Body = firstChunk, // Only first chunk for metadata logging
                 ContentType = response.Content?.Headers?.ContentType?.ToString() ?? string.Empty
             };
-
-            // Prepare metadata for background processing
-            var responseMetadata = new
+            // Prepare metadata for logging
+            var metadataResponse = new
             {
                 responseInfo.RequestId,
                 responseInfo.Timestamp,
@@ -308,63 +296,33 @@ public class RequestResponseLogger : IDisposable
                 TotalBytes = totalBytes,
                 FirstChunkBase64 = firstChunk.Length > 0 ? Convert.ToBase64String(firstChunk) : null,
                 FirstChunkText = TryGetTextContent(firstChunk, responseInfo.ContentType),
-                IsPartialContent = true,
-                Note = $"Streaming mode: Only first {firstChunk.Length} bytes logged out of {totalBytes} total bytes"
+                Note = $"Streaming response - {totalBytes} bytes total, first {firstChunk.Length} bytes captured"
             };
-
-            var rawResponse = GenerateRawHttpResponseMetadata(response, firstChunk, totalBytes);
-
+            var rawResponse = $"HTTP/{response.Version} {(int)response.StatusCode} {response.ReasonPhrase}\r\n" +
+                             string.Join("\r\n", response.Headers.Select(h => $"{h.Key}: {string.Join(", ", h.Value)}")) +
+                             (response.Content?.Headers != null ? "\r\n" + string.Join("\r\n", response.Content.Headers.Select(h => $"{h.Key}: {string.Join(", ", h.Value)}")) : "") +
+                             $"\r\n\r\n[STREAMING RESPONSE - {totalBytes} bytes total, first {firstChunk.Length} bytes shown]\r\n" +
+                             (firstChunk.Length > 0 ? Encoding.UTF8.GetString(firstChunk) : "[No content captured]");
             // Queue for background processing
             _loggingQueue.EnqueueLogEntry(new LogEntry
             {
                 RequestId = requestId,
                 Timestamp = timestamp,
-                Type = LogEntryType.ResponseMetadata,
-                ResponseData = responseMetadata,
+                Type = LogEntryType.Response,
+                ResponseData = metadataResponse,
                 RawContent = rawResponse
             });
-
-            // Update active requests tracking with null checks
-            if (_activeRequests.TryGetValue(requestId, out var pair) && pair?.Request != null)
-            {
-                pair.Response = responseInfo;
-                pair.CompletedAt = DateTime.Now;
-
-                // Queue complete data with metadata
-                var completeData = CreateCompleteDataWithMetadata(pair, totalBytes);
-                _loggingQueue.EnqueueLogEntry(new LogEntry
-                {
-                    RequestId = requestId,
-                    Timestamp = timestamp,
-                    Type = LogEntryType.Complete,
-                    CompleteData = completeData
-                });
-
-                _activeRequests.TryRemove(requestId, out _);
-            }
-
-            // Calculate duration and queue realtime logs
-            var duration = DateTime.Now - timestamp;
-            var summaryMessage = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] RESPONSE {requestId}: {response.StatusCode} ({duration.TotalMilliseconds:F0}ms) [STREAMING: {totalBytes} bytes]";
-            var rawMessage = $"=== RESPONSE {requestId} at {DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} (STREAMING) ===\n{rawResponse}\n";
-            
-            _realtimeLogQueue.EnqueueRealtimeLog(new RealtimeLogEntry
-            {
-                SummaryMessage = summaryMessage,
-                RawMessage = rawMessage
-            });
-
             // Console output
+            var duration = DateTime.Now - timestamp;
             var statusColor = GetStatusColor((int)response.StatusCode);
             var escapedStatusCode = EscapeMarkup(response.StatusCode.ToString());
             var escapedRequestId = EscapeMarkup(requestId);
-            AnsiConsole.MarkupLine($"[dim]{DateTime.Now:HH:mm:ss.fff}[/] [bold red]←[/] [{statusColor}]{escapedStatusCode}[/] [dim]({duration.TotalMilliseconds:F0}ms) ({FormatBytes(totalBytes)}) ({escapedRequestId})[/]");
+            AnsiConsole.MarkupLine($"[dim]{DateTime.Now:HH:mm:ss.fff}[/] [bold red]←[/] [{statusColor}]{escapedStatusCode}[/] [dim]({duration.TotalMilliseconds:F0}ms) ({escapedRequestId}) [STREAMED {totalBytes} bytes][/]");
         }
         catch (Exception ex)
         {
             LogError($"Error logging response metadata {requestId}: {ex.Message}");
         }
-
         return Task.CompletedTask;
     }
 
