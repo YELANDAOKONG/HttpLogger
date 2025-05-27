@@ -88,8 +88,10 @@ public class RequestResponseLogger : IDisposable
         var pair = new RequestResponsePair { Request = requestInfo };
         _activeRequests.TryAdd(requestId, pair);
 
-        // Only console output (fast operation) - no file I/O on main thread
-        AnsiConsole.MarkupLine($"[dim]{timestamp:HH:mm:ss.fff}[/] [bold green]→[/] [cyan]{request.HttpMethod}[/] {request.Url?.AbsolutePath} [dim]({requestId})[/]");
+        // Console output with proper escaping for Spectre.Console
+        var urlPath = request.Url?.AbsolutePath ?? string.Empty;
+        var escapedUrlPath = EscapeMarkup(urlPath);
+        AnsiConsole.MarkupLine($"[dim]{timestamp:HH:mm:ss.fff}[/] [bold green]→[/] [cyan]{request.HttpMethod}[/] {escapedUrlPath} [dim]({requestId})[/]");
 
         return Task.CompletedTask;
     }
@@ -193,7 +195,7 @@ public class RequestResponseLogger : IDisposable
             RawMessage = rawMessage
         });
 
-        // Only console output (fast operation) - no file I/O on main thread
+        // Console output with proper status color
         var statusColor = GetStatusColor((int)response.StatusCode);
         AnsiConsole.MarkupLine($"[dim]{DateTime.Now:HH:mm:ss.fff}[/] [bold red]←[/] [{statusColor}]{response.StatusCode}[/] [dim]({duration.TotalMilliseconds:F0}ms) ({requestId})[/]");
 
@@ -223,8 +225,9 @@ public class RequestResponseLogger : IDisposable
             RawMessage = null
         });
         
-        // Only console output on main thread
-        AnsiConsole.MarkupLine($"[dim]{DateTime.Now:HH:mm:ss.fff}[/] [bold blue]ℹ[/] {message}");
+        // Console output with proper escaping
+        var escapedMessage = EscapeMarkup(message);
+        AnsiConsole.MarkupLine($"[dim]{DateTime.Now:HH:mm:ss.fff}[/] [bold blue]ℹ[/] {escapedMessage}");
     }
 
     public void LogError(string message)
@@ -238,11 +241,22 @@ public class RequestResponseLogger : IDisposable
             RawMessage = null
         });
         
-        // Only console output on main thread
-        AnsiConsole.MarkupLine($"[dim]{DateTime.Now:HH:mm:ss.fff}[/] [bold red]✗[/] {message}");
+        // Console output with proper escaping
+        var escapedMessage = EscapeMarkup(message);
+        AnsiConsole.MarkupLine($"[dim]{DateTime.Now:HH:mm:ss.fff}[/] [bold red]✗[/] {escapedMessage}");
     }
 
-    // 保留所有现有的辅助方法
+    /// <summary>
+    /// Escapes markup characters for safe display in Spectre.Console
+    /// </summary>
+    private static string EscapeMarkup(string text)
+    {
+        if (string.IsNullOrEmpty(text))
+            return text;
+
+        return text.Replace("[", "[[").Replace("]", "]]");
+    }
+    
     private static string GenerateRawHttpRequest(HttpListenerRequest request, byte[] body)
     {
         var sb = new StringBuilder();
@@ -330,7 +344,7 @@ public class RequestResponseLogger : IDisposable
         return result;
     }
 
-    private static Dictionary<string, string> ExtractHeaders(System.Net.Http.Headers.HttpHeaders headers1, System.Net.Http.Headers.HttpHeaders? headers2 = null)
+        private static Dictionary<string, string> ExtractHeaders(System.Net.Http.Headers.HttpHeaders headers1, System.Net.Http.Headers.HttpHeaders? headers2 = null)
     {
         var result = new Dictionary<string, string>();
         
@@ -422,3 +436,4 @@ public class RequestResponseLogger : IDisposable
         public DateTime? CompletedAt { get; set; }
     }
 }
+
