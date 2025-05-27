@@ -8,6 +8,9 @@ static class Program
 {
     public static async Task Main(string[] args)
     {
+        RequestResponseLogger? logger = null;
+        ProxyServer? proxyServer = null;
+        
         try
         {
             var config = ParseArguments(args);
@@ -17,8 +20,8 @@ static class Program
                 return;
             }
 
-            var logger = new RequestResponseLogger(config.OutputPath);
-            var proxyServer = new ProxyServer(config, logger);
+            logger = new RequestResponseLogger(config.OutputPath);
+            proxyServer = new ProxyServer(config, logger);
 
             // Create a nice banner
             AnsiConsole.Write(new Rule("[bold blue]HTTP Logger Proxy[/]"));
@@ -42,22 +45,68 @@ static class Program
             AnsiConsole.WriteLine();
 
             using var cts = new CancellationTokenSource();
+            var shutdownRequested = false;
+            
             Console.CancelKeyPress += (_, e) =>
             {
                 e.Cancel = true;
-                if (!cts.Token.IsCancellationRequested)
+                if (!shutdownRequested)
                 {
+                    shutdownRequested = true;
                     cts.Cancel();
                     AnsiConsole.MarkupLine("\n[yellow]Stopping server gracefully...[/]");
                 }
+                else
+                {
+                    // Force exit if user presses Ctrl+C again
+                    AnsiConsole.MarkupLine("\n[red]Force stopping...[/]");
+                    Environment.Exit(1);
+                }
             };
 
-            await proxyServer.StartAsync(cts.Token);
+            // Start server with timeout for graceful shutdown
+            var serverTask = proxyServer.StartAsync(cts.Token);
+            
+            // Wait for server to complete or timeout
+            var completedTask = await Task.WhenAny(
+                serverTask,
+                Task.Delay(Timeout.Infinite, cts.Token)
+            );
+
+            if (completedTask == serverTask)
+            {
+                await serverTask; // Propagate any exceptions
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Expected during shutdown
+            AnsiConsole.MarkupLine("[dim]Shutdown completed.[/]");
         }
         catch (Exception ex)
         {
             AnsiConsole.WriteException(ex);
             Environment.Exit(1);
+        }
+        finally
+        {
+            // Ensure resources are disposed properly
+            try
+            {
+                if (logger != null)
+                {
+                    AnsiConsole.MarkupLine("[dim]Flushing logs...[/]");
+                    await logger.FlushAsync();
+                    logger.Dispose();
+                }
+                
+                proxyServer?.Dispose();
+                AnsiConsole.MarkupLine("[dim]Cleanup completed.[/]");
+            }
+            catch (Exception ex)
+            {
+                AnsiConsole.MarkupLine($"[red]Error during cleanup: {ex.Message}[/]");
+            }
         }
     }
 
@@ -66,35 +115,48 @@ static class Program
         if (args.Length < 4)
             return null;
 
-        var config = new ProxyConfiguration
+        try
         {
-            LocalAddress = args[0],
-            LocalPort = int.Parse(args[1]),
-            RemoteAddress = args[2],
-            RemotePort = int.Parse(args[3]),
-            IgnoreSslErrors = false,
-            OutputPath = Path.GetTempPath()
-        };
-
-        for (int i = 4; i < args.Length; i++)
-        {
-            switch (args[i].ToLower())
+            var config = new ProxyConfiguration
             {
-                case "--ignore-ssl":
-                case "-k":
-                    config.IgnoreSslErrors = true;
-                    break;
-                case "--output":
-                case "-o":
-                    if (i + 1 < args.Length)
-                    {
-                        config.OutputPath = args[++i];
-                    }
-                    break;
-            }
-        }
+                LocalAddress = args[0],
+                LocalPort = int.Parse(args[1]),
+                RemoteAddress = args[2],
+                RemotePort = int.Parse(args[3]),
+                IgnoreSslErrors = false,
+                OutputPath = Path.GetTempPath()
+            };
 
-        return config;
+            for (int i = 4; i < args.Length; i++)
+            {
+                switch (args[i].ToLower())
+                {
+                    case "--ignore-ssl":
+                    case "-k":
+                        config.IgnoreSslErrors = true;
+                        break;
+                    case "--output":
+                    case "-o":
+                        if (i + 1 < args.Length)
+                        {
+                            config.OutputPath = args[++i];
+                        }
+                        break;
+                }
+            }
+
+            return config;
+        }
+        catch (FormatException)
+        {
+            AnsiConsole.MarkupLine("[red]Error: Invalid port number format[/]");
+            return null;
+        }
+        catch (Exception ex)
+        {
+            AnsiConsole.MarkupLine($"[red]Error parsing arguments: {ex.Message}[/]");
+            return null;
+        }
     }
 
     private static void ShowUsage()

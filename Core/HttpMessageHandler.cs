@@ -22,7 +22,7 @@ public class HttpMessageHandler : IDisposable
 
         _httpClient = new HttpClient(handler)
         {
-            Timeout = TimeSpan.FromMinutes(5) // Reasonable timeout
+            Timeout = TimeSpan.FromMinutes(2) // Reduced from 5 to 2 minutes
         };
     }
 
@@ -34,45 +34,66 @@ public class HttpMessageHandler : IDisposable
         var requestId = Guid.NewGuid().ToString("N")[..8];
         var timestamp = DateTime.Now;
 
+        // Create cancellation token for this request with timeout
+        using var requestCts = new CancellationTokenSource(TimeSpan.FromMinutes(2));
+        var cancellationToken = requestCts.Token;
+
         try
         {
-            // Read request body
-            var requestBody = await ReadRequestBodyAsync(request);
+            // Read request body with timeout
+            var requestBody = await ReadRequestBodyAsync(request, cancellationToken);
             
             // Log request
             await _logger.LogRequestAsync(requestId, timestamp, request, requestBody);
 
-            // Forward request to remote server
-            var remoteResponse = await ForwardRequestAsync(request, requestBody);
+            // Forward request to remote server with timeout
+            var remoteResponse = await ForwardRequestAsync(request, requestBody, cancellationToken);
             
-            // Read response body
-            var responseBody = await remoteResponse.Content.ReadAsByteArrayAsync();
+            // Read response body with timeout
+            var responseBody = await remoteResponse.Content.ReadAsByteArrayAsync(cancellationToken);
             
             // Log response
             await _logger.LogResponseAsync(requestId, timestamp, remoteResponse, responseBody);
 
             // Send response back to client
-            await SendResponseToClientAsync(response, remoteResponse, responseBody);
+            await SendResponseToClientAsync(response, remoteResponse, responseBody, cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            _logger.LogError($"[{requestId}] Request timeout after 2 minutes");
+            await SendTimeoutResponse(response);
+        }
+        catch (TaskCanceledException ex) when (ex.InnerException is TimeoutException)
+        {
+            _logger.LogError($"[{requestId}] HTTP request timeout");
+            await SendTimeoutResponse(response);
+        }
+        catch (HttpRequestException ex)
+        {
+            _logger.LogError($"[{requestId}] HTTP error: {ex.Message}");
+            await SendErrorResponse(response, "Remote server error", 502);
         }
         catch (Exception ex)
         {
             _logger.LogError($"[{requestId}] Error: {ex.Message}");
-            throw;
+            await SendErrorResponse(response, "Internal proxy error", 500);
         }
     }
 
-    private async Task<byte[]> ReadRequestBodyAsync(HttpListenerRequest request)
+    private async Task<byte[]> ReadRequestBodyAsync(HttpListenerRequest request, CancellationToken cancellationToken)
     {
         if (!request.HasEntityBody)
             return Array.Empty<byte>();
 
         using var bodyStream = request.InputStream;
         using var memoryStream = new MemoryStream();
-        await bodyStream.CopyToAsync(memoryStream);
+        
+        // Add timeout for reading request body
+        await bodyStream.CopyToAsync(memoryStream, cancellationToken);
         return memoryStream.ToArray();
     }
 
-    private async Task<HttpResponseMessage> ForwardRequestAsync(HttpListenerRequest request, byte[] requestBody)
+    private async Task<HttpResponseMessage> ForwardRequestAsync(HttpListenerRequest request, byte[] requestBody, CancellationToken cancellationToken)
     {
         var targetUri = new Uri($"{_config.RemoteBaseUrl}{request.Url!.PathAndQuery}");
         
@@ -115,10 +136,11 @@ public class HttpMessageHandler : IDisposable
             }
         }
 
-        return await _httpClient.SendAsync(requestMessage);
+        // Send with cancellation token for timeout control
+        return await _httpClient.SendAsync(requestMessage, cancellationToken);
     }
 
-    private async Task SendResponseToClientAsync(HttpListenerResponse response, HttpResponseMessage remoteResponse, byte[] responseBody)
+    private async Task SendResponseToClientAsync(HttpListenerResponse response, HttpResponseMessage remoteResponse, byte[] responseBody, CancellationToken cancellationToken)
     {
         response.StatusCode = (int)remoteResponse.StatusCode;
         response.StatusDescription = remoteResponse.ReasonPhrase ?? string.Empty;
@@ -158,14 +180,55 @@ public class HttpMessageHandler : IDisposable
             }
         }
 
-        // Write response body
+        // Write response body with timeout
         if (responseBody.Length > 0)
         {
             response.ContentLength64 = responseBody.Length;
-            await response.OutputStream.WriteAsync(responseBody);
+            
+            // Use timeout for writing response
+            var writeTask = response.OutputStream.WriteAsync(responseBody, 0, responseBody.Length, cancellationToken);
+            await writeTask;
         }
 
         response.Close();
+    }
+
+    private static async Task SendTimeoutResponse(HttpListenerResponse response)
+    {
+        try
+        {
+            response.StatusCode = 504; // Gateway Timeout
+            response.ContentType = "text/plain; charset=utf-8";
+            
+            var message = "Proxy Error: Request timeout"u8.ToArray();
+            response.ContentLength64 = message.Length;
+            
+            await response.OutputStream.WriteAsync(message);
+            response.Close();
+        }
+        catch
+        {
+            // Ignore errors when sending timeout response
+        }
+    }
+
+    private static async Task SendErrorResponse(HttpListenerResponse response, string message, int statusCode)
+    {
+        try
+        {
+            response.StatusCode = statusCode;
+            response.ContentType = "text/plain; charset=utf-8";
+            
+            var buffer = System.Text.Encoding.UTF8.GetBytes($"Proxy Error: {message}");
+            response.ContentLength64 = buffer.Length;
+            
+            await response.OutputStream.WriteAsync(buffer);
+            response.Close();
+        }
+        catch
+        {
+            // Ignore errors when sending error response
+        }
     }
 
     private static bool IsHopByHopHeader(string headerName)

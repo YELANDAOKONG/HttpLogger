@@ -10,6 +10,7 @@ public class ProxyServer : IDisposable
     private readonly RequestResponseLogger _logger;
     private readonly HttpListener _listener;
     private readonly HttpMessageHandler _messageHandler;
+    private readonly SemaphoreSlim _requestSemaphore;
     private bool _disposed;
 
     public ProxyServer(ProxyConfiguration config, RequestResponseLogger logger)
@@ -21,6 +22,9 @@ public class ProxyServer : IDisposable
         _listener.Prefixes.Add(_config.LocalUrl);
         
         _messageHandler = new HttpMessageHandler(_config, _logger);
+        
+        // Limit concurrent requests to prevent resource exhaustion
+        _requestSemaphore = new SemaphoreSlim(50, 50);
     }
 
     public async Task StartAsync(CancellationToken cancellationToken = default)
@@ -47,35 +51,13 @@ public class ProxyServer : IDisposable
             {
                 try
                 {
-                    // Use a timeout to make GetContextAsync responsive to cancellation
-                    var contextTask = _listener.GetContextAsync();
-                    var delayTask = Task.Delay(1000, cancellationToken); // Check cancellation every second
+                    // Use GetContextAsync with cancellation
+                    var context = await GetContextWithCancellationAsync(cancellationToken);
+                    if (context == null)
+                        continue;
                     
-                    var completedTask = await Task.WhenAny(contextTask, delayTask);
-                    
-                    if (completedTask == delayTask)
-                    {
-                        // Timeout occurred, check if cancellation was requested
-                        if (cancellationToken.IsCancellationRequested)
-                            break;
-                        continue; // Continue waiting for requests
-                    }
-
-                    var context = await contextTask;
-                    
-                    // Handle request asynchronously without blocking
-                    _ = Task.Run(async () =>
-                    {
-                        try
-                        {
-                            await _messageHandler.HandleRequestAsync(context);
-                        }
-                        catch (Exception ex)
-                        {
-                            _logger.LogError($"Error handling request: {ex.Message}");
-                            await SendErrorResponse(context.Response, ex.Message);
-                        }
-                    }, CancellationToken.None); // Don't cancel individual request handling
+                    // Handle request with concurrency control
+                    _ = HandleRequestWithSemaphoreAsync(context, cancellationToken);
                 }
                 catch (HttpListenerException ex) when (ex.ErrorCode == 995) // ERROR_OPERATION_ABORTED
                 {
@@ -90,6 +72,11 @@ public class ProxyServer : IDisposable
                 catch (InvalidOperationException)
                 {
                     // Listener stopped
+                    break;
+                }
+                catch (OperationCanceledException)
+                {
+                    // Cancellation requested
                     break;
                 }
             }
@@ -112,18 +99,81 @@ public class ProxyServer : IDisposable
         }
     }
 
+    private async Task<HttpListenerContext?> GetContextWithCancellationAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            var contextTask = _listener.GetContextAsync();
+            
+            // Wait for either context or cancellation
+            var tcs = new TaskCompletionSource<HttpListenerContext?>();
+            
+            using var registration = cancellationToken.Register(() => tcs.TrySetResult(null));
+            
+            var completedTask = await Task.WhenAny(contextTask, tcs.Task);
+            
+            if (completedTask == tcs.Task)
+            {
+                return await tcs.Task; // Will be null if cancelled
+            }
+            
+            return await contextTask;
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+    }
+
+    private async Task HandleRequestWithSemaphoreAsync(HttpListenerContext context, CancellationToken serverCancellationToken)
+    {
+        // Wait for semaphore with timeout to prevent hanging
+        var acquired = await _requestSemaphore.WaitAsync(TimeSpan.FromSeconds(30), serverCancellationToken);
+        if (!acquired)
+        {
+            _logger.LogError("Request rejected: Server too busy");
+            await SendErrorResponse(context.Response, "Server too busy");
+            return;
+        }
+
+        try
+        {
+            // Create timeout for individual request processing
+            using var requestCts = CancellationTokenSource.CreateLinkedTokenSource(serverCancellationToken);
+            requestCts.CancelAfter(TimeSpan.FromMinutes(3)); // Total request timeout
+
+            await _messageHandler.HandleRequestAsync(context);
+        }
+        catch (OperationCanceledException) when (serverCancellationToken.IsCancellationRequested)
+        {
+            // Server shutdown, ignore
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError($"Error handling request: {ex.Message}");
+            await SendErrorResponse(context.Response, ex.Message);
+        }
+        finally
+        {
+            _requestSemaphore.Release();
+        }
+    }
+
     private static async Task SendErrorResponse(HttpListenerResponse response, string message)
     {
         try
         {
-            response.StatusCode = 500;
-            response.ContentType = "text/plain";
-            
-            var buffer = Encoding.UTF8.GetBytes($"Proxy Error: {message}");
-            response.ContentLength64 = buffer.Length;
-            
-            await response.OutputStream.WriteAsync(buffer);
-            response.Close();
+            if (response.OutputStream.CanWrite)
+            {
+                response.StatusCode = 500;
+                response.ContentType = "text/plain; charset=utf-8";
+                
+                var buffer = Encoding.UTF8.GetBytes($"Proxy Error: {message}");
+                response.ContentLength64 = buffer.Length;
+                
+                await response.OutputStream.WriteAsync(buffer);
+                response.Close();
+            }
         }
         catch
         {
@@ -146,6 +196,7 @@ public class ProxyServer : IDisposable
             }
             
             _messageHandler?.Dispose();
+            _requestSemaphore?.Dispose();
             _disposed = true;
         }
     }

@@ -9,14 +9,9 @@ namespace HttpLogger.Core;
 public class RequestResponseLogger : IDisposable
 {
     private readonly string _sessionPath;
-    private readonly string _summaryLogPath;
-    private readonly string _rawLogPath;
-    private readonly FileStream _summaryLogStream;
-    private readonly FileStream _rawLogStream;
-    private readonly StreamWriter _summaryLogWriter;
-    private readonly StreamWriter _rawLogWriter;
-    private readonly object _logLock = new();
     private readonly ConcurrentDictionary<string, RequestResponsePair> _activeRequests = new();
+    private readonly LoggingQueue _loggingQueue;
+    private readonly RealtimeLogQueue _realtimeLogQueue;
     private bool _disposed;
 
     public string SessionPath => _sessionPath;
@@ -34,20 +29,14 @@ public class RequestResponseLogger : IDisposable
         Directory.CreateDirectory(Path.Combine(_sessionPath, "complete"));
         Directory.CreateDirectory(Path.Combine(_sessionPath, "raw"));
 
-        // Initialize log files
-        _summaryLogPath = Path.Combine(_sessionPath, "summary.log");
-        _rawLogPath = Path.Combine(_sessionPath, "raw_traffic.log");
-
-        _summaryLogStream = new FileStream(_summaryLogPath, FileMode.Create, FileAccess.Write, FileShare.Read);
-        _rawLogStream = new FileStream(_rawLogPath, FileMode.Create, FileAccess.Write, FileShare.Read);
-        
-        _summaryLogWriter = new StreamWriter(_summaryLogStream, Encoding.UTF8) { AutoFlush = true };
-        _rawLogWriter = new StreamWriter(_rawLogStream, Encoding.UTF8) { AutoFlush = true };
+        // Initialize background logging queues
+        _loggingQueue = new LoggingQueue(_sessionPath);
+        _realtimeLogQueue = new RealtimeLogQueue(_sessionPath);
 
         LogInfo($"HTTP Logger session started. Session directory: {_sessionPath}");
     }
 
-    public async Task LogRequestAsync(string requestId, DateTime timestamp, HttpListenerRequest request, byte[] body)
+    public Task LogRequestAsync(string requestId, DateTime timestamp, HttpListenerRequest request, byte[] body)
     {
         var requestInfo = new RequestInfo
         {
@@ -60,32 +49,52 @@ public class RequestResponseLogger : IDisposable
             ContentType = request.ContentType ?? string.Empty
         };
 
-        // Generate timestamped filename
-        var timestampStr = timestamp.ToString("yyyyMMdd_HHmmss_fff");
-        
-        // Save request to individual JSON file
-        var requestJsonPath = Path.Combine(_sessionPath, "requests", $"{timestampStr}_{requestId}_request.json");
-        await SaveRequestToFileAsync(requestJsonPath, requestInfo);
+        // Prepare data for background processing
+        var requestData = new
+        {
+            requestInfo.RequestId,
+            requestInfo.Timestamp,
+            requestInfo.Method,
+            requestInfo.Url,
+            requestInfo.Headers,
+            requestInfo.ContentType,
+            BodyBase64 = requestInfo.Body.Length > 0 ? Convert.ToBase64String(requestInfo.Body) : null,
+            BodyText = TryGetTextContent(requestInfo.Body, requestInfo.ContentType)
+        };
 
-        // Save RAW request
-        var requestRawPath = Path.Combine(_sessionPath, "raw", $"{timestampStr}_{requestId}_request.txt");
-        await SaveRawRequestAsync(requestRawPath, request, body);
+        var rawRequest = GenerateRawHttpRequest(request, body);
+
+        // Queue for background processing (non-blocking)
+        _loggingQueue.EnqueueLogEntry(new LogEntry
+        {
+            RequestId = requestId,
+            Timestamp = timestamp,
+            Type = LogEntryType.Request,
+            RequestData = requestData,
+            RawContent = rawRequest
+        });
+
+        // Queue realtime logs for background processing too
+        var summaryMessage = $"[{timestamp:yyyy-MM-dd HH:mm:ss.fff}] REQUEST {requestId}: {request.HttpMethod} {request.Url}";
+        var rawMessage = $"=== REQUEST {requestId} at {timestamp:yyyy-MM-dd HH:mm:ss.fff} ===\n{rawRequest}\n";
+        
+        _realtimeLogQueue.EnqueueRealtimeLog(new RealtimeLogEntry
+        {
+            SummaryMessage = summaryMessage,
+            RawMessage = rawMessage
+        });
 
         // Add to active requests tracking
         var pair = new RequestResponsePair { Request = requestInfo };
         _activeRequests.TryAdd(requestId, pair);
 
-        // Log to both summary and raw files
-        var summaryMessage = $"[{timestamp:yyyy-MM-dd HH:mm:ss.fff}] REQUEST {requestId}: {request.HttpMethod} {request.Url}";
-        var rawRequest = GenerateRawHttpRequest(request, body);
-        
-        LogToFiles(summaryMessage, $"=== REQUEST {requestId} at {timestamp:yyyy-MM-dd HH:mm:ss.fff} ===\n{rawRequest}\n");
-
-        // Console output with colors
+        // Only console output (fast operation) - no file I/O on main thread
         AnsiConsole.MarkupLine($"[dim]{timestamp:HH:mm:ss.fff}[/] [bold green]→[/] [cyan]{request.HttpMethod}[/] {request.Url?.AbsolutePath} [dim]({requestId})[/]");
+
+        return Task.CompletedTask;
     }
 
-    public async Task LogResponseAsync(string requestId, DateTime timestamp, HttpResponseMessage response, byte[] body)
+    public Task LogResponseAsync(string requestId, DateTime timestamp, HttpResponseMessage response, byte[] body)
     {
         var responseInfo = new ResponseInfo
         {
@@ -98,40 +107,97 @@ public class RequestResponseLogger : IDisposable
             ContentType = response.Content?.Headers?.ContentType?.ToString() ?? string.Empty
         };
 
-        // Generate timestamped filename
-        var timestampStr = timestamp.ToString("yyyyMMdd_HHmmss_fff");
-        
-        // Save response to individual JSON file
-        var responseJsonPath = Path.Combine(_sessionPath, "responses", $"{timestampStr}_{requestId}_response.json");
-        await SaveResponseToFileAsync(responseJsonPath, responseInfo);
+        // Prepare data for background processing
+        var responseData = new
+        {
+            responseInfo.RequestId,
+            responseInfo.Timestamp,
+            responseInfo.StatusCode,
+            responseInfo.StatusDescription,
+            responseInfo.Headers,
+            responseInfo.ContentType,
+            BodyBase64 = responseInfo.Body.Length > 0 ? Convert.ToBase64String(responseInfo.Body) : null,
+            BodyText = TryGetTextContent(responseInfo.Body, responseInfo.ContentType)
+        };
 
-        // Save RAW response
-        var responseRawPath = Path.Combine(_sessionPath, "raw", $"{timestampStr}_{requestId}_response.txt");
-        await SaveRawResponseAsync(responseRawPath, response, body);
+        var rawResponse = GenerateRawHttpResponse(response, body);
 
-        // Update active requests tracking
+        // Queue for background processing (non-blocking)
+        _loggingQueue.EnqueueLogEntry(new LogEntry
+        {
+            RequestId = requestId,
+            Timestamp = timestamp,
+            Type = LogEntryType.Response,
+            ResponseData = responseData,
+            RawContent = rawResponse
+        });
+
+        // Update active requests tracking and queue complete data
         if (_activeRequests.TryGetValue(requestId, out var pair))
         {
             pair.Response = responseInfo;
             pair.CompletedAt = DateTime.Now;
 
-            // Save complete request-response pair
-            var completeJsonPath = Path.Combine(_sessionPath, "complete", $"{timestampStr}_{requestId}_complete.json");
-            await SaveRequestResponsePairAsync(completeJsonPath, pair);
+            // Queue complete pair for background processing
+            double? durationMs = null;
+            if (pair.CompletedAt.HasValue)
+            {
+                durationMs = (pair.CompletedAt.Value - pair.Request.Timestamp).TotalMilliseconds;
+            }
+
+            var completeData = new
+            {
+                RequestId = pair.Request.RequestId,
+                StartTime = pair.Request.Timestamp,
+                CompletedAt = pair.CompletedAt,
+                DurationMs = durationMs,
+                Request = new
+                {
+                    pair.Request.Method,
+                    pair.Request.Url,
+                    pair.Request.Headers,
+                    pair.Request.ContentType,
+                    BodyBase64 = pair.Request.Body.Length > 0 ? Convert.ToBase64String(pair.Request.Body) : null,
+                    BodyText = TryGetTextContent(pair.Request.Body, pair.Request.ContentType)
+                },
+                Response = new
+                {
+                    pair.Response.StatusCode,
+                    pair.Response.StatusDescription,
+                    pair.Response.Headers,
+                    pair.Response.ContentType,
+                    BodyBase64 = pair.Response.Body.Length > 0 ? Convert.ToBase64String(pair.Response.Body) : null,
+                    BodyText = TryGetTextContent(pair.Response.Body, pair.Response.ContentType)
+                }
+            };
+
+            _loggingQueue.EnqueueLogEntry(new LogEntry
+            {
+                RequestId = requestId,
+                Timestamp = timestamp,
+                Type = LogEntryType.Complete,
+                CompleteData = completeData
+            });
 
             _activeRequests.TryRemove(requestId, out _);
         }
 
-        // Calculate duration
+        // Queue realtime logs for background processing
         var duration = DateTime.Now - timestamp;
         var summaryMessage = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] RESPONSE {requestId}: {response.StatusCode} ({duration.TotalMilliseconds:F0}ms)";
-        var rawResponse = GenerateRawHttpResponse(response, body);
+        var rawMessage = $"=== RESPONSE {requestId} at {DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} ===\n{rawResponse}\n";
         
-        LogToFiles(summaryMessage, $"=== RESPONSE {requestId} at {DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} ===\n{rawResponse}\n");
+        _realtimeLogQueue.EnqueueRealtimeLog(new RealtimeLogEntry
+        {
+            SummaryMessage = summaryMessage,
+            RawMessage = rawMessage
+        });
 
-        // Console output with colors
+        // Only console output (fast operation) - no file I/O on main thread
         var statusColor = GetStatusColor((int)response.StatusCode);
         AnsiConsole.MarkupLine($"[dim]{DateTime.Now:HH:mm:ss.fff}[/] [bold red]←[/] [{statusColor}]{response.StatusCode}[/] [dim]({duration.TotalMilliseconds:F0}ms) ({requestId})[/]");
+
+        return Task.CompletedTask;
     }
 
     private static string GetStatusColor(int statusCode)
@@ -149,30 +215,34 @@ public class RequestResponseLogger : IDisposable
     public void LogInfo(string message)
     {
         var logMessage = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] INFO: {message}";
-        LogToFiles(logMessage, null);
+        
+        // Queue for background processing
+        _realtimeLogQueue.EnqueueRealtimeLog(new RealtimeLogEntry
+        {
+            SummaryMessage = logMessage,
+            RawMessage = null
+        });
+        
+        // Only console output on main thread
         AnsiConsole.MarkupLine($"[dim]{DateTime.Now:HH:mm:ss.fff}[/] [bold blue]ℹ[/] {message}");
     }
 
     public void LogError(string message)
     {
         var logMessage = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] ERROR: {message}";
-        LogToFiles(logMessage, null);
+        
+        // Queue for background processing
+        _realtimeLogQueue.EnqueueRealtimeLog(new RealtimeLogEntry
+        {
+            SummaryMessage = logMessage,
+            RawMessage = null
+        });
+        
+        // Only console output on main thread
         AnsiConsole.MarkupLine($"[dim]{DateTime.Now:HH:mm:ss.fff}[/] [bold red]✗[/] {message}");
     }
 
-    private void LogToFiles(string summaryMessage, string? rawMessage)
-    {
-        lock (_logLock)
-        {
-            _summaryLogWriter.WriteLine(summaryMessage);
-            
-            if (rawMessage != null)
-            {
-                _rawLogWriter.WriteLine(rawMessage);
-            }
-        }
-    }
-
+    // 保留所有现有的辅助方法
     private static string GenerateRawHttpRequest(HttpListenerRequest request, byte[] body)
     {
         var sb = new StringBuilder();
@@ -247,18 +317,6 @@ public class RequestResponseLogger : IDisposable
         return sb.ToString();
     }
 
-    private static async Task SaveRawRequestAsync(string filePath, HttpListenerRequest request, byte[] body)
-    {
-        var rawContent = GenerateRawHttpRequest(request, body);
-        await File.WriteAllTextAsync(filePath, rawContent, Encoding.UTF8);
-    }
-
-    private static async Task SaveRawResponseAsync(string filePath, HttpResponseMessage response, byte[] body)
-    {
-        var rawContent = GenerateRawHttpResponse(response, body);
-        await File.WriteAllTextAsync(filePath, rawContent, Encoding.UTF8);
-    }
-
     private static Dictionary<string, string> ExtractHeaders(System.Collections.Specialized.NameValueCollection headers)
     {
         var result = new Dictionary<string, string>();
@@ -292,80 +350,6 @@ public class RequestResponseLogger : IDisposable
         return result;
     }
 
-    private static async Task SaveRequestToFileAsync(string filePath, RequestInfo request)
-    {
-        var requestData = new
-        {
-            request.RequestId,
-            request.Timestamp,
-            request.Method,
-            request.Url,
-            request.Headers,
-            request.ContentType,
-            BodyBase64 = request.Body.Length > 0 ? Convert.ToBase64String(request.Body) : null,
-            BodyText = TryGetTextContent(request.Body, request.ContentType)
-        };
-
-        var json = JsonSerializer.Serialize(requestData, new JsonSerializerOptions { WriteIndented = true });
-        await File.WriteAllTextAsync(filePath, json, Encoding.UTF8);
-    }
-
-    private static async Task SaveResponseToFileAsync(string filePath, ResponseInfo response)
-    {
-        var responseData = new
-        {
-            response.RequestId,
-            response.Timestamp,
-            response.StatusCode,
-            response.StatusDescription,
-            response.Headers,
-            response.ContentType,
-            BodyBase64 = response.Body.Length > 0 ? Convert.ToBase64String(response.Body) : null,
-            BodyText = TryGetTextContent(response.Body, response.ContentType)
-        };
-
-        var json = JsonSerializer.Serialize(responseData, new JsonSerializerOptions { WriteIndented = true });
-        await File.WriteAllTextAsync(filePath, json, Encoding.UTF8);
-    }
-
-    private static async Task SaveRequestResponsePairAsync(string filePath, RequestResponsePair pair)
-    {
-        double? durationMs = null;
-        if (pair.CompletedAt.HasValue)
-        {
-            durationMs = (pair.CompletedAt.Value - pair.Request.Timestamp).TotalMilliseconds;
-        }
-
-        var pairData = new
-        {
-            RequestId = pair.Request.RequestId,
-            StartTime = pair.Request.Timestamp,
-            CompletedAt = pair.CompletedAt,
-            DurationMs = durationMs,
-            Request = new
-            {
-                pair.Request.Method,
-                pair.Request.Url,
-                pair.Request.Headers,
-                pair.Request.ContentType,
-                BodyBase64 = pair.Request.Body.Length > 0 ? Convert.ToBase64String(pair.Request.Body) : null,
-                BodyText = TryGetTextContent(pair.Request.Body, pair.Request.ContentType)
-            },
-            Response = pair.Response != null ? new
-            {
-                pair.Response.StatusCode,
-                pair.Response.StatusDescription,
-                pair.Response.Headers,
-                pair.Response.ContentType,
-                BodyBase64 = pair.Response.Body.Length > 0 ? Convert.ToBase64String(pair.Response.Body) : null,
-                BodyText = TryGetTextContent(pair.Response.Body, pair.Response.ContentType)
-            } : null
-        };
-
-        var json = JsonSerializer.Serialize(pairData, new JsonSerializerOptions { WriteIndented = true });
-        await File.WriteAllTextAsync(filePath, json, Encoding.UTF8);
-    }
-
     private static string? TryGetTextContent(byte[] body, string contentType)
     {
         if (body.Length == 0)
@@ -391,18 +375,20 @@ public class RequestResponseLogger : IDisposable
         }
     }
 
+    public async Task FlushAsync()
+    {
+        await _loggingQueue.FlushAsync();
+        await _realtimeLogQueue.FlushAsync();
+    }
+
     public void Dispose()
     {
         if (!_disposed)
         {
-            lock (_logLock)
-            {
-                LogInfo("HTTP Logger session stopped.");
-                _summaryLogWriter?.Dispose();
-                _rawLogWriter?.Dispose();
-                _summaryLogStream?.Dispose();
-                _rawLogStream?.Dispose();
-            }
+            LogInfo("HTTP Logger session stopped.");
+            
+            _loggingQueue?.Dispose();
+            _realtimeLogQueue?.Dispose();
             _disposed = true;
         }
     }
