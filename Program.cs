@@ -1,5 +1,6 @@
 ﻿using HttpLogger.Core;
 using Spectre.Console;
+using System.Text;
 
 namespace HttpLogger;
 
@@ -20,31 +21,35 @@ static class Program
             var proxyServer = new ProxyServer(config, logger);
 
             // Create a nice banner
-            var rule = new Rule("[bold blue]HTTP Logger Proxy[/]")
-            {
-                Justification = Justify.Center
-            };
-            AnsiConsole.Write(rule);
+            AnsiConsole.Write(new Rule("[bold blue]HTTP Logger Proxy[/]"));
 
-            // Display configuration in a table
-            var table = new Table();
-            table.AddColumn("[bold]Setting[/]");
-            table.AddColumn("[bold]Value[/]");
-            table.AddRow("Local Address", $"[cyan]{config.LocalAddress}:{config.LocalPort}[/]");
-            table.AddRow("Remote Address", $"[yellow]{config.RemoteAddress}:{config.RemotePort}[/]");
-            table.AddRow("Output Directory", $"[green]{config.OutputPath}[/]");
-            table.AddRow("Ignore SSL Errors", config.IgnoreSslErrors ? "[red]Yes[/]" : "[green]No[/]");
+            // Display configuration in a panel (now with actual session path)
+            var configText = new StringBuilder();
+            configText.AppendLine($"[cyan]Local:[/] {config.LocalAddress}:{config.LocalPort}");
+            configText.AppendLine($"[yellow]Remote:[/] {config.RemoteAddress}:{config.RemotePort}");
+            configText.AppendLine($"[green]Session Directory:[/] {logger.SessionPath}");
+            configText.AppendLine($"[dim]SSL Validation:[/] {(config.IgnoreSslErrors ? "[red]Disabled[/]" : "[green]Enabled[/]")}");
+
+            var panel = new Panel(configText.ToString())
+            {
+                Header = new PanelHeader("[bold]Configuration[/]"),
+                Border = BoxBorder.Rounded,
+                Padding = new Padding(1, 0, 1, 0)
+            };
             
-            AnsiConsole.Write(table);
-            AnsiConsole.WriteLine();
+            AnsiConsole.Write(panel);
             AnsiConsole.MarkupLine("[bold green]Press Ctrl+C to stop...[/]");
+            AnsiConsole.WriteLine();
 
             using var cts = new CancellationTokenSource();
             Console.CancelKeyPress += (_, e) =>
             {
                 e.Cancel = true;
-                cts.Cancel();
-                AnsiConsole.MarkupLine("\n[red]Shutting down...[/]");
+                if (!cts.Token.IsCancellationRequested)
+                {
+                    cts.Cancel();
+                    AnsiConsole.MarkupLine("\n[yellow]Stopping server gracefully...[/]");
+                }
             };
 
             await proxyServer.StartAsync(cts.Token);
@@ -94,13 +99,11 @@ static class Program
 
     private static void ShowUsage()
     {
-        var rule = new Rule("[bold red]Usage Information[/]")
-        {
-            Justification = Justify.Center
-        };
-        AnsiConsole.Write(rule);
-
-        AnsiConsole.MarkupLine("[bold]Usage:[/] HttpLogger [cyan]<local_address> <local_port> <remote_address> <remote_port>[/] [dim][options][/]");
+        AnsiConsole.Write(new Rule("[bold red]Usage Information[/]"));
+        
+        AnsiConsole.Write(new Markup("[bold]Usage:[/] HttpLogger "));
+        AnsiConsole.Write(new Markup("[cyan]<local_address> <local_port> <remote_address> <remote_port>[/] "));
+        AnsiConsole.WriteLine("[options]");
         AnsiConsole.WriteLine();
         
         var table = new Table();
@@ -113,6 +116,6 @@ static class Program
         AnsiConsole.WriteLine();
         
         AnsiConsole.MarkupLine("[bold]Example:[/]");
-        AnsiConsole.MarkupLine("  [dim]HttpLogger 127.0.0.1 8080 api.example.com 443 --ignore-ssl --output ./logs[/]");
+        AnsiConsole.MarkupLine("  HttpLogger 127.0.0.1 8080 api.example.com 443 --ignore-ssl --output ./logs");
     }
 }

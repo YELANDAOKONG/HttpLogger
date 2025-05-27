@@ -19,6 +19,8 @@ public class RequestResponseLogger : IDisposable
     private readonly ConcurrentDictionary<string, RequestResponsePair> _activeRequests = new();
     private bool _disposed;
 
+    public string SessionPath => _sessionPath;
+
     public RequestResponseLogger(string basePath)
     {
         // Create session-specific subdirectory

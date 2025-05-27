@@ -1,5 +1,6 @@
 ﻿using System.Net;
 using System.Text;
+using Spectre.Console;
 
 namespace HttpLogger.Core;
 
@@ -27,38 +28,86 @@ public class ProxyServer : IDisposable
         _listener.Start();
         _logger.LogInfo($"Proxy server started on {_config.LocalUrl}");
 
+        // Register cancellation to stop the listener
+        cancellationToken.Register(() =>
+        {
+            try
+            {
+                _listener?.Stop();
+            }
+            catch (ObjectDisposedException)
+            {
+                // Already disposed, ignore
+            }
+        });
+
         try
         {
             while (!cancellationToken.IsCancellationRequested)
             {
-                var context = await _listener.GetContextAsync();
-                
-                // Handle request asynchronously without blocking
-                _ = Task.Run(async () =>
+                try
                 {
-                    try
+                    // Use a timeout to make GetContextAsync responsive to cancellation
+                    var contextTask = _listener.GetContextAsync();
+                    var delayTask = Task.Delay(1000, cancellationToken); // Check cancellation every second
+                    
+                    var completedTask = await Task.WhenAny(contextTask, delayTask);
+                    
+                    if (completedTask == delayTask)
                     {
-                        await _messageHandler.HandleRequestAsync(context);
+                        // Timeout occurred, check if cancellation was requested
+                        if (cancellationToken.IsCancellationRequested)
+                            break;
+                        continue; // Continue waiting for requests
                     }
-                    catch (Exception ex)
+
+                    var context = await contextTask;
+                    
+                    // Handle request asynchronously without blocking
+                    _ = Task.Run(async () =>
                     {
-                        _logger.LogError($"Error handling request: {ex.Message}");
-                        await SendErrorResponse(context.Response, ex.Message);
-                    }
-                }, cancellationToken);
+                        try
+                        {
+                            await _messageHandler.HandleRequestAsync(context);
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogError($"Error handling request: {ex.Message}");
+                            await SendErrorResponse(context.Response, ex.Message);
+                        }
+                    }, CancellationToken.None); // Don't cancel individual request handling
+                }
+                catch (HttpListenerException ex) when (ex.ErrorCode == 995) // ERROR_OPERATION_ABORTED
+                {
+                    // Expected when cancellation is requested
+                    break;
+                }
+                catch (ObjectDisposedException)
+                {
+                    // Expected when cancellation is requested
+                    break;
+                }
+                catch (InvalidOperationException)
+                {
+                    // Listener stopped
+                    break;
+                }
             }
-        }
-        catch (ObjectDisposedException)
-        {
-            // Expected when cancellation is requested
-        }
-        catch (HttpListenerException ex) when (ex.ErrorCode == 995) // ERROR_OPERATION_ABORTED
-        {
-            // Expected when cancellation is requested
         }
         finally
         {
-            _listener.Stop();
+            try
+            {
+                if (_listener.IsListening)
+                {
+                    _listener.Stop();
+                }
+            }
+            catch (ObjectDisposedException)
+            {
+                // Already disposed
+            }
+            
             _logger.LogInfo("Proxy server stopped");
         }
     }
@@ -86,7 +135,16 @@ public class ProxyServer : IDisposable
     {
         if (!_disposed)
         {
-            _listener?.Close();
+            try
+            {
+                _listener?.Stop();
+                _listener?.Close();
+            }
+            catch (ObjectDisposedException)
+            {
+                // Already disposed
+            }
+            
             _messageHandler?.Dispose();
             _disposed = true;
         }
